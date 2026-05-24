@@ -402,6 +402,79 @@ def resolve_diffsynth_dir(cfg_value: str) -> Path:
     return DIFFSYNTH_DEFAULT_DIR
 
 
+DIFFSYNTH_GIT_URL = "https://github.com/modelscope/DiffSynth-Studio.git"
+
+
+def ensure_diffsynth_installed(diffsynth_dir: Path):
+    """Generator yielding log lines, ensuring `import diffsynth` works in `sys.executable`.
+
+    Final yield is a tuple ('__done__', ok: bool, message: str).
+    Clones the repo if missing, then runs `pip install -e` against the current Python.
+    This protects against venv / system-Python mix-ups (e.g. Colab + .venv) where the
+    user's previous setup installed DiffSynth into a different interpreter than the one
+    actually launching training.
+    """
+    # Quick check first: maybe it's already importable in this interpreter.
+    check = subprocess.run(
+        [sys.executable, "-c", "import diffsynth"],
+        capture_output=True, text=True,
+    )
+    if check.returncode == 0:
+        yield "✓ DiffSynth-Studio is already importable in current Python."
+        yield ("__done__", True, "already installed")
+        return
+
+    yield f"DiffSynth-Studio not importable from {sys.executable} — installing now."
+
+    # Clone if missing
+    if not diffsynth_dir.exists():
+        yield f"Cloning {DIFFSYNTH_GIT_URL} → {diffsynth_dir} ..."
+        try:
+            proc = subprocess.Popen(
+                ["git", "clone", "--depth", "1", DIFFSYNTH_GIT_URL, str(diffsynth_dir)],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                universal_newlines=True, bufsize=1, encoding="utf-8", errors="ignore",
+            )
+        except FileNotFoundError:
+            yield ("__done__", False, "git not found on PATH — install git and retry")
+            return
+        for line in iter(proc.stdout.readline, ""):
+            yield line.rstrip("\n")
+        proc.wait()
+        if proc.returncode != 0:
+            yield ("__done__", False, f"git clone failed (exit {proc.returncode})")
+            return
+
+    if not (diffsynth_dir / DIFFSYNTH_TRAIN_SCRIPT_REL).exists():
+        yield ("__done__", False, f"Cloned dir is missing {DIFFSYNTH_TRAIN_SCRIPT_REL}")
+        return
+
+    # Editable install against the CURRENT interpreter
+    yield f"Running: {sys.executable} -m pip install -e {diffsynth_dir}"
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "pip", "install", "-e", str(diffsynth_dir)],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        universal_newlines=True, bufsize=1, encoding="utf-8", errors="ignore",
+    )
+    for line in iter(proc.stdout.readline, ""):
+        yield line.rstrip("\n")
+    proc.wait()
+    if proc.returncode != 0:
+        yield ("__done__", False, f"pip install -e failed (exit {proc.returncode})")
+        return
+
+    # Verify
+    check2 = subprocess.run(
+        [sys.executable, "-c", "import diffsynth; print(diffsynth.__file__)"],
+        capture_output=True, text=True,
+    )
+    if check2.returncode != 0:
+        yield ("__done__", False, f"After install, `import diffsynth` still fails:\n{check2.stderr}")
+        return
+    yield f"✓ DiffSynth installed at: {check2.stdout.strip()}"
+    yield ("__done__", True, "installed")
+
+
 # ---------------------------------------------------------------------------
 # Configure Training handler
 # ---------------------------------------------------------------------------
@@ -552,13 +625,13 @@ def configure_training(
         lines.append(t("info_dataset_cfg_written", path=dataset_cfg))
 
     elif backend == "diffsynth":
-        # Verify DiffSynth-Studio exists
+        # Soft check — if DiffSynth-Studio isn't cloned yet, just inform the user.
+        # Actual install happens at training time via ensure_diffsynth_installed().
         ds_dir = resolve_diffsynth_dir(diffsynth_dir)
         ds_script = ds_dir / DIFFSYNTH_TRAIN_SCRIPT_REL
         if not ds_script.exists():
             lines.append("")
-            lines.append(t("err_diffsynth_missing", path=str(ds_dir)))
-            return "\n".join(lines), "", "", "", ""
+            lines.append(t("info_diffsynth_will_install", path=str(ds_dir)))
 
         lines.append(t("info_generating_metadata"))
         try:
@@ -771,7 +844,7 @@ def start_training(
             return
 
         cmd = [
-            "accelerate", "launch",
+            sys.executable, "-m", "accelerate", "launch",
             "--config_file", str(ACCELERATE_CONFIG),
             "--num_cpu_threads_per_process", str(threads),
             "--gpu_ids", gpu_idx,
@@ -796,13 +869,28 @@ def start_training(
             return
 
         ds_dir = resolve_diffsynth_dir(diffsynth_dir or saved_cfg.get("diffsynth_dir", ""))
+
+        # Make sure DiffSynth is installed in *this* interpreter — auto-clones
+        # and pip-installs if missing. Streams progress to the log box.
+        yield emit(t("info_diffsynth_check"))
+        install_ok = False
+        install_msg = ""
+        for item in ensure_diffsynth_installed(ds_dir):
+            if isinstance(item, tuple) and item and item[0] == "__done__":
+                _, install_ok, install_msg = item
+            else:
+                yield emit(item)
+        if not install_ok:
+            yield emit(t("err_diffsynth_install_failed", err=install_msg))
+            return
+
         ds_script = ds_dir / DIFFSYNTH_TRAIN_SCRIPT_REL
         if not ds_script.exists():
             yield emit(t("err_diffsynth_missing", path=str(ds_dir)))
             return
 
         cmd = [
-            "accelerate", "launch",
+            sys.executable, "-m", "accelerate", "launch",
             "--config_file", str(ACCELERATE_CONFIG),
             "--num_cpu_threads_per_process", str(threads),
             "--gpu_ids", gpu_idx,

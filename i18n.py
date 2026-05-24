@@ -170,6 +170,9 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "info_ready": "✓ Configuration complete — ready to train.",
         "err_generate_failed": "❌ Failed to generate configs: {err}",
         "err_diffsynth_missing": "❌ DiffSynth-Studio not found at: {path}\nClone it with: git clone https://github.com/modelscope/DiffSynth-Studio.git",
+        "info_diffsynth_will_install": "ℹ DiffSynth-Studio not found at {path}. It will be cloned and installed automatically when training starts.",
+        "info_diffsynth_check": "🔎 Checking DiffSynth-Studio install for the current Python interpreter...",
+        "err_diffsynth_install_failed": "❌ DiffSynth-Studio install failed: {err}",
         # start_training messages
         "info_using_gpu": "Using GPU index: {idx}",
         "info_command": "Command: {cmd}",
@@ -341,6 +344,9 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "info_ready": "✓ 配置完成 — 可以开始训练。",
         "err_generate_failed": "❌ 生成配置失败：{err}",
         "err_diffsynth_missing": "❌ 未找到 DiffSynth-Studio：{path}\n请运行：git clone https://github.com/modelscope/DiffSynth-Studio.git",
+        "info_diffsynth_will_install": "ℹ 路径 {path} 下未找到 DiffSynth-Studio。开始训练时将自动克隆并安装。",
+        "info_diffsynth_check": "🔎 正在检查当前 Python 解释器中的 DiffSynth-Studio 安装状态...",
+        "err_diffsynth_install_failed": "❌ DiffSynth-Studio 安装失败：{err}",
         # start_training
         "info_using_gpu": "使用 GPU：{idx}",
         "info_command": "命令：{cmd}",
