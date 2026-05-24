@@ -73,7 +73,8 @@ TB_LOGS_ROOT.mkdir(exist_ok=True, parents=True)
 
 # Project-local accelerate config — keeps use_cpu=false and mixed_precision=bf16
 # scoped to this app only. See app_configs/accelerate_gpu.yaml to change these.
-ACCELERATE_CONFIG = "app_configs/accelerate_gpu.yaml"
+# Absolute path so cwd switching (DiffSynth backend uses ds_dir as cwd) doesn't break resolution.
+ACCELERATE_CONFIG = str(ROOT / "app_configs" / "accelerate_gpu.yaml")
 
 # ---------------------------------------------------------------------------
 # Default settings
