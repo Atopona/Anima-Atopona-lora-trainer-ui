@@ -182,6 +182,7 @@ time you launch the app.
 | "No images found" | Verify images are not named `.txt` only |
 | `accelerate` not found | Make sure you're running via the `run_*.sh/bat` script |
 | Model missing | Re-run `setup_for_linux.sh` / `setup_for_windows.bat` |
+| `torchao 0.10.0` incompatible with PEFT | DiffSynth startup now auto-upgrades old `torchao` to `torchao>0.16.0`; rerun training after updating `app.py` |
 
 ---
 

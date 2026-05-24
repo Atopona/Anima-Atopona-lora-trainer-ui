@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 import atexit
+import importlib.metadata as importlib_metadata
 from datetime import datetime
 from pathlib import Path
 
@@ -47,6 +48,8 @@ SD_SCRIPTS_DIR = ROOT / "sd-scripts"
 DIFFSYNTH_DEFAULT_DIR = ROOT / "DiffSynth-Studio"
 DIFFSYNTH_GIT_URL = "https://github.com/modelscope/DiffSynth-Studio.git"
 DIFFSYNTH_LEGACY_ANIMA_TARGET_MODULES = "q,k,v,o,ffn.0,ffn.2"
+TORCHAO_MIN_EXCLUSIVE_VERSION = (0, 16, 0)
+TORCHAO_PIP_SPEC = "torchao>0.16.0"
 
 DIT_MODEL = MODELS_DIR / "dit" / "anima-preview.safetensors"
 QWEN3_MODEL = MODELS_DIR / "text_encoder" / "qwen_3_06b_base.safetensors"
@@ -419,6 +422,26 @@ def migrate_diffsynth_args_for_anima(args: list[str]) -> list[str]:
     return args
 
 
+def parse_version_tuple(value: str) -> tuple[int, ...]:
+    parts = re.findall(r"\d+", value.split("+", 1)[0])
+    return tuple(int(part) for part in parts[:3])
+
+
+def is_version_at_most(value: str, limit: tuple[int, ...]) -> bool:
+    parsed = parse_version_tuple(value)
+    if not parsed:
+        return False
+    max_len = max(len(parsed), len(limit))
+    return parsed + (0,) * (max_len - len(parsed)) <= limit + (0,) * (max_len - len(limit))
+
+
+def installed_package_version(name: str) -> str | None:
+    try:
+        return importlib_metadata.version(name)
+    except importlib_metadata.PackageNotFoundError:
+        return None
+
+
 def create_diffsynth_training_args(
     project_name: str, output_dir: str,
     dit_model_path: Path, qwen3_model_path: Path, vae_model_path: Path,
@@ -561,6 +584,35 @@ def ensure_diffsynth_installed(diffsynth_dir: Path):
         proc.wait()
         return proc.returncode
 
+    def ensure_torchao_compatible():
+        version = installed_package_version("torchao")
+        if version is None:
+            return True, "torchao not installed"
+        if not is_version_at_most(version, TORCHAO_MIN_EXCLUSIVE_VERSION):
+            yield f"torchao {version} is compatible with PEFT."
+            return True, "torchao compatible"
+
+        yield (
+            f"torchao {version} is incompatible with current PEFT; "
+            f"upgrading to {TORCHAO_PIP_SPEC} ..."
+        )
+        returncode = yield from stream_process(
+            [sys.executable, "-m", "pip", "install", "--upgrade", TORCHAO_PIP_SPEC]
+        )
+        if returncode == 0:
+            new_version = installed_package_version("torchao") or "unknown"
+            yield f"torchao upgraded to {new_version}."
+            return True, "torchao upgraded"
+
+        yield "torchao upgrade failed; uninstalling incompatible torchao so PEFT can use standard LoRA dispatch."
+        returncode = yield from stream_process(
+            [sys.executable, "-m", "pip", "uninstall", "-y", "torchao"]
+        )
+        if returncode != 0:
+            return False, f"torchao upgrade/uninstall failed (exit {returncode})"
+        yield "Incompatible torchao removed."
+        return True, "torchao removed"
+
     def clone_repo():
         yield f"Cloning {DIFFSYNTH_GIT_URL} -> {diffsynth_dir} ..."
         try:
@@ -615,6 +667,10 @@ def ensure_diffsynth_installed(diffsynth_dir: Path):
         try:
             imported_path.relative_to(diffsynth_dir.resolve())
             yield f"DiffSynth-Studio is already installed from: {imported_path}"
+            torchao_ok, torchao_msg = yield from ensure_torchao_compatible()
+            if not torchao_ok:
+                yield ("__done__", False, torchao_msg)
+                return
             yield ("__done__", True, "already installed")
             return
         except ValueError:
@@ -641,6 +697,10 @@ def ensure_diffsynth_installed(diffsynth_dir: Path):
         yield ("__done__", False, f"After install, import diffsynth still fails:\n{check2.stderr}")
         return
     yield f"DiffSynth installed at: {check2.stdout.strip()}"
+    torchao_ok, torchao_msg = yield from ensure_torchao_compatible()
+    if not torchao_ok:
+        yield ("__done__", False, torchao_msg)
+        return
     yield ("__done__", True, "installed")
 
 
