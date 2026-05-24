@@ -69,6 +69,27 @@ popd > /dev/null
 echo "      ✓ sd-scripts requirements installed."
 
 # -----------------------------------------------------------------------------
+# 3b. (Optional) Clone & install DiffSynth-Studio for the DiffSynth backend.
+#     Skip with: SKIP_DIFFSYNTH=1 bash setup_for_linux.sh
+# -----------------------------------------------------------------------------
+echo ""
+if [ "${SKIP_DIFFSYNTH:-0}" = "1" ]; then
+    echo "[3b/6] Skipping DiffSynth-Studio install (SKIP_DIFFSYNTH=1)."
+elif [ ! -d "DiffSynth-Studio" ]; then
+    echo "[3b/6] Cloning DiffSynth-Studio (optional alternative backend)..."
+    if git clone https://github.com/modelscope/DiffSynth-Studio.git; then
+        pushd DiffSynth-Studio > /dev/null
+        pip install -e .
+        popd > /dev/null
+        echo "      ✓ DiffSynth-Studio installed."
+    else
+        echo "      WARN: DiffSynth-Studio clone failed. The kohya backend will still work."
+    fi
+else
+    echo "[3b/6] DiffSynth-Studio already present — skipping clone."
+fi
+
+# -----------------------------------------------------------------------------
 # 4. Install app requirements (gradio, toml)
 # -----------------------------------------------------------------------------
 echo ""

@@ -1,18 +1,37 @@
 """
 Anima LoRA Trainer — Local Gradio UI
+Supports kohya-ss/sd-scripts and DiffSynth-Studio backends,
+with TensorBoard logging and Chinese / English UI.
 """
 
+import csv
 import json
 import math
 import os
+import re
 import shlex
+import socket
 import subprocess
 import sys
+import threading
+import time
+import atexit
 from datetime import datetime
 from pathlib import Path
 
 import gradio as gr
 import toml
+
+from i18n import t, get_lang, set_lang, SUPPORTED_LANGS
+
+try:
+    from pyngrok import ngrok as _ngrok
+    PYNGROK_AVAILABLE = True
+except ImportError:
+    PYNGROK_AVAILABLE = False
+    _ngrok = None
+
+IS_COLAB = ("COLAB_GPU" in os.environ) or ("COLAB_RELEASE_TAG" in os.environ)
 
 # ---------------------------------------------------------------------------
 # Paths (all relative to the project root where app.py lives)
@@ -21,23 +40,25 @@ ROOT = Path(__file__).resolve().parent
 CONFIG_FILE = ROOT / "config.json"
 CONFIGS_DIR = ROOT / "configs"
 LOGS_DIR = ROOT / "logs"
+TB_LOGS_ROOT = LOGS_DIR / "tb"
 MODELS_DIR = ROOT / "models" / "anima"
 SD_SCRIPTS_DIR = ROOT / "sd-scripts"
+DIFFSYNTH_DEFAULT_DIR = ROOT / "DiffSynth-Studio"
 
 DIT_MODEL = MODELS_DIR / "dit" / "anima-preview.safetensors"
 QWEN3_MODEL = MODELS_DIR / "text_encoder" / "qwen_3_06b_base.safetensors"
 VAE_MODEL = MODELS_DIR / "vae" / "qwen_image_vae.safetensors"
 TRAIN_SCRIPT = SD_SCRIPTS_DIR / "anima_train_network.py"
+DIFFSYNTH_TRAIN_SCRIPT_REL = "examples/anima/model_training/train.py"
 
 BASE_MODEL_URLS = {
-    "anima-base-v1.0" : "https://huggingface.co/circlestone-labs/Anima/resolve/main/split_files/diffusion_models/anima-base-v1.0.safetensors",
+    "anima-base-v1.0": "https://huggingface.co/circlestone-labs/Anima/resolve/main/split_files/diffusion_models/anima-base-v1.0.safetensors",
     "anima-preview3-base": "https://huggingface.co/circlestone-labs/Anima/resolve/main/split_files/diffusion_models/anima-preview3-base.safetensors",
-    "anima-preview": "https://huggingface.co/circlestone-labs/Anima/resolve/main/split_files/diffusion_models/anima-preview.safetensors"
+    "anima-preview": "https://huggingface.co/circlestone-labs/Anima/resolve/main/split_files/diffusion_models/anima-preview.safetensors",
 }
 
 
 def get_dit_model_path(base_model: str) -> Path:
-    """Return the local Path for the selected base model's DiT weights."""
     filenames = {
         "anima-base-v1.0": "anima-base-v1.0.safetensors",
         "anima-preview": "anima-preview.safetensors",
@@ -45,17 +66,34 @@ def get_dit_model_path(base_model: str) -> Path:
     }
     return MODELS_DIR / "dit" / filenames.get(base_model, "anima-base-v1.0.safetensors")
 
+
 CONFIGS_DIR.mkdir(exist_ok=True)
 LOGS_DIR.mkdir(exist_ok=True)
+TB_LOGS_ROOT.mkdir(exist_ok=True, parents=True)
 
 # Project-local accelerate config — keeps use_cpu=false and mixed_precision=bf16
-# scoped to this app only. See configs/accelerate_gpu.yaml to change these.
+# scoped to this app only. See app_configs/accelerate_gpu.yaml to change these.
 ACCELERATE_CONFIG = "app_configs/accelerate_gpu.yaml"
 
 # ---------------------------------------------------------------------------
 # Default settings
 # ---------------------------------------------------------------------------
 DEFAULTS = {
+    # Language / backend (new)
+    "language": "en",
+    "backend": "kohya",
+    "diffsynth_dir": "",
+    # TensorBoard (new)
+    "use_tensorboard": True,
+    "tb_port": 6006,
+    "tb_logdir": "",  # auto-derived per run if empty
+    "ngrok_enable": False,
+    "ngrok_token": "",
+    # DiffSynth-specific (new)
+    "lora_target_modules": "q,k,v,o,ffn.0,ffn.2",
+    "dataset_repeat": 50,
+    "max_pixels": 1048576,
+    "save_steps_ds": 0,
     # Basic
     "project_name": "my_lora",
     "base_model": "anima-base-v1.0",
@@ -94,18 +132,20 @@ DEFAULTS = {
     # Internal
     "last_train_config": "",
     "last_dataset_config": "",
+    "last_diffsynth_args": "",
+    "last_tb_logdir": "",
 }
+
 
 # ---------------------------------------------------------------------------
 # Config persistence
 # ---------------------------------------------------------------------------
 
 def load_config() -> dict:
-    """Load config.json, filling missing keys with defaults."""
     cfg = dict(DEFAULTS)
     if CONFIG_FILE.exists():
         try:
-            with open(CONFIG_FILE, "r") as f:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 saved = json.load(f)
             cfg.update({k: v for k, v in saved.items() if k in DEFAULTS})
         except Exception:
@@ -114,9 +154,17 @@ def load_config() -> dict:
 
 
 def save_config(cfg: dict):
-    """Persist config.json."""
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(cfg, f, indent=2)
+    # Preserve any keys not in DEFAULTS (e.g. language was already saved by i18n)
+    existing = {}
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+        except Exception:
+            existing = {}
+    existing.update(cfg)
+    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(existing, f, indent=2, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------
@@ -124,10 +172,8 @@ def save_config(cfg: dict):
 # ---------------------------------------------------------------------------
 
 def detect_gpus() -> list[str]:
-    """Return a list of GPU choices. Falls back to ['0', '1'] if torch unavailable."""
     try:
         import torch
-
         if not torch.cuda.is_available():
             return ["CPU (no CUDA detected)"]
         choices = []
@@ -143,7 +189,6 @@ GPU_CHOICES = detect_gpus()
 
 
 def gpu_index_from_choice(choice: str) -> str:
-    """Extract the numeric GPU index from a dropdown choice string."""
     if not choice:
         return "0"
     return str(choice).split(":")[0].strip()
@@ -157,10 +202,6 @@ IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
 
 
 def validate_dataset(image_dir: str) -> tuple[int, list[str], list[str]]:
-    """
-    Returns (image_count, missing_captions, warnings).
-    Raises FileNotFoundError if directory doesn't exist.
-    """
     p = Path(image_dir)
     if not p.exists():
         raise FileNotFoundError(f"Directory not found: {image_dir}")
@@ -173,20 +214,43 @@ def validate_dataset(image_dir: str) -> tuple[int, list[str], list[str]]:
 
     missing = [f.name for f in image_files if f.stem not in txt_basenames]
     warnings = []
-
     if not image_files:
         warnings.append("No image files found in directory.")
     if missing:
         warnings.append(f"{len(missing)} image(s) are missing caption (.txt) files.")
-
     return len(image_files), missing, warnings
 
 
 # ---------------------------------------------------------------------------
-# TOML config generation (ported directly from the notebook)
+# DiffSynth metadata.csv generation
 # ---------------------------------------------------------------------------
 
-def create_training_config(
+def generate_diffsynth_metadata(image_dir: str, output_path: Path) -> tuple[Path, int]:
+    """Scan a kohya-style flat dir and write a DiffSynth metadata.csv with columns file_name,text."""
+    rows = []
+    for img in sorted(Path(image_dir).iterdir()):
+        if not img.is_file() or img.suffix.lower() not in IMAGE_EXTS:
+            continue
+        txt = img.with_suffix(".txt")
+        caption = ""
+        if txt.exists():
+            try:
+                caption = txt.read_text(encoding="utf-8").strip().replace("\n", " ")
+            except Exception:
+                caption = ""
+        rows.append({"file_name": img.name, "text": caption})
+    with open(output_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["file_name", "text"])
+        writer.writeheader()
+        writer.writerows(rows)
+    return output_path, len(rows)
+
+
+# ---------------------------------------------------------------------------
+# kohya TOML config generation (ported directly from the notebook)
+# ---------------------------------------------------------------------------
+
+def create_kohya_training_config(
     project_name, output_dir, dit_model_path, qwen3_model_path, vae_model_path,
     network_dim=20, network_alpha=20, learning_rate=1e-4, max_train_epochs=10,
     optimizer_type="AdamW8bit", lr_scheduler="cosine_with_restarts",
@@ -198,8 +262,8 @@ def create_training_config(
     timestep_sampling="sigmoid", discrete_flow_shift=1.0,
     cache_latents=True, cache_text_encoder_outputs=True,
     vae_chunk_size=64, vae_disable_cache=True,
+    logging_dir: str = "",
 ) -> str:
-    """Generate training TOML and return its path."""
     os.makedirs(output_dir, exist_ok=True)
     current_date = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     config_path = CONFIGS_DIR / f"{project_name}_training_{current_date}.toml"
@@ -245,20 +309,18 @@ def create_training_config(
         "multires_noise_discount": float(multires_noise_discount),
         "training_comment": f"Anima LoRA - {datetime.now().strftime('%Y-%m-%d')}",
     }
+    if logging_dir:
+        training_config["log_with"] = "tensorboard"
+        training_config["logging_dir"] = str(logging_dir)
 
-    with open(config_path, "w") as f:
+    with open(config_path, "w", encoding="utf-8") as f:
         toml.dump(training_config, f)
-
     return str(config_path)
 
 
-def create_dataset_config(
-    project_name, image_dir, resolution=768, repeats=5, caption_dropout_rate=0.1
-) -> str:
-    """Generate dataset TOML and return its path."""
+def create_dataset_config(project_name, image_dir, resolution=768, repeats=5, caption_dropout_rate=0.1) -> str:
     current_date = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     config_path = CONFIGS_DIR / f"{project_name}_dataset_{current_date}.toml"
-
     dataset_config = {
         "general": {
             "resolution": int(resolution),
@@ -282,11 +344,61 @@ def create_dataset_config(
             }
         ],
     }
-
-    with open(config_path, "w") as f:
+    with open(config_path, "w", encoding="utf-8") as f:
         toml.dump(dataset_config, f)
-
     return str(config_path)
+
+
+# ---------------------------------------------------------------------------
+# DiffSynth CLI-arg generation
+# ---------------------------------------------------------------------------
+
+def create_diffsynth_training_args(
+    project_name: str, output_dir: str,
+    dit_model_path: Path, qwen3_model_path: Path, vae_model_path: Path,
+    image_dir: str, metadata_csv: str,
+    learning_rate: float, max_train_epochs: int,
+    dataset_repeat: int, max_pixels: int,
+    lora_rank: int, lora_target_modules: str,
+    use_gradient_checkpointing: bool,
+    gradient_accumulation_steps: int,
+    save_steps: int,
+) -> tuple[list[str], str]:
+    """Build the DiffSynth CLI args list and persist them next to other configs."""
+    current_date = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    args_path = CONFIGS_DIR / f"{project_name}_diffsynth_args_{current_date}.json"
+
+    model_paths_json = json.dumps([str(dit_model_path), str(qwen3_model_path), str(vae_model_path)])
+
+    args: list[str] = [
+        "--dataset_base_path", str(image_dir),
+        "--dataset_metadata_path", str(metadata_csv),
+        "--max_pixels", str(int(max_pixels)),
+        "--dataset_repeat", str(int(dataset_repeat)),
+        "--model_paths", model_paths_json,
+        "--learning_rate", str(float(learning_rate)),
+        "--num_epochs", str(int(max_train_epochs)),
+        "--remove_prefix_in_ckpt", "pipe.dit.",
+        "--output_path", str(output_dir),
+        "--lora_base_model", "dit",
+        "--lora_target_modules", lora_target_modules or "q,k,v,o,ffn.0,ffn.2",
+        "--lora_rank", str(int(lora_rank)),
+        "--gradient_accumulation_steps", str(int(gradient_accumulation_steps)),
+    ]
+    if use_gradient_checkpointing:
+        args.append("--use_gradient_checkpointing")
+    if save_steps and int(save_steps) > 0:
+        args += ["--save_steps", str(int(save_steps))]
+
+    with open(args_path, "w", encoding="utf-8") as f:
+        json.dump(args, f, indent=2, ensure_ascii=False)
+    return args, str(args_path)
+
+
+def resolve_diffsynth_dir(cfg_value: str) -> Path:
+    if cfg_value and cfg_value.strip():
+        return Path(cfg_value).expanduser()
+    return DIFFSYNTH_DEFAULT_DIR
 
 
 # ---------------------------------------------------------------------------
@@ -294,10 +406,11 @@ def create_dataset_config(
 # ---------------------------------------------------------------------------
 
 def configure_training(
+    backend, diffsynth_dir,
     project_name, base_model, image_directory, output_directory,
     network_dim, network_alpha, learning_rate, max_train_epochs,
     resolution, repeats, caption_dropout, gpu_index_choice,
-    # advanced
+    # advanced (kohya)
     optimizer_type, lr_scheduler, lr_scheduler_num_cycles, lr_warmup_steps,
     train_batch_size, gradient_accumulation_steps, max_grad_norm,
     save_every_n_epochs, save_last_n_epochs, mixed_precision,
@@ -305,64 +418,71 @@ def configure_training(
     timestep_sampling, discrete_flow_shift,
     cache_latents, cache_text_encoder_outputs, vae_chunk_size, vae_disable_cache,
     num_cpu_threads_per_process,
-) -> tuple[str, str, str]:
+    # DiffSynth-specific
+    lora_target_modules, dataset_repeat, max_pixels, save_steps_ds,
+    # TensorBoard
+    use_tensorboard, tb_logdir_input, tb_port,
+) -> tuple[str, str, str, str, str]:
     """
-    Validate dataset, generate TOML configs, save settings to config.json.
-    Returns (status_message, last_train_config_path, last_dataset_config_path).
+    Returns (status_message, last_train_config_path, last_dataset_config_path,
+             last_diffsynth_args_path, last_tb_logdir).
     """
     lines = []
+    backend = (backend or "kohya").lower()
 
     # --- Validate inputs ---
     if not project_name.strip():
-        return "❌ Project name cannot be empty.", "", ""
+        return t("err_project_empty"), "", "", "", ""
     if not image_directory.strip():
-        return "❌ Image directory cannot be empty.", "", ""
+        return t("err_image_dir_empty"), "", "", "", ""
     if not output_directory.strip():
-        return "❌ Output directory cannot be empty.", "", ""
+        return t("err_output_dir_empty"), "", "", "", ""
 
-    lines.append(f"Project:          {project_name}")
-    lines.append(f"Image directory:  {image_directory}")
-    lines.append(f"Output directory: {output_directory}")
+    lines.append(t("info_backend", backend=backend))
+    lines.append(t("info_project", name=project_name))
+    lines.append(t("info_image_dir", dir=image_directory))
+    lines.append(t("info_output_dir", dir=output_directory))
     lines.append("")
 
     # --- Validate dataset ---
     try:
         n_images, missing, warnings = validate_dataset(image_directory)
     except (FileNotFoundError, NotADirectoryError) as e:
-        return f"❌ {e}", "", ""
+        return f"❌ {e}", "", "", "", ""
 
-    lines.append(f"Images found:     {n_images}")
+    lines.append(t("info_images_found", n=n_images))
     if missing:
-        lines.append(f"⚠ Missing captions ({len(missing)}):")
+        lines.append(t("info_missing_captions", n=len(missing)))
         for m in missing[:20]:
             lines.append(f"    • {m}")
         if len(missing) > 20:
-            lines.append(f"    … and {len(missing) - 20} more")
+            lines.append(t("info_more", n=len(missing) - 20))
     else:
-        lines.append("✓ All images have caption files.")
+        lines.append(t("info_all_have_captions"))
 
     for w in warnings:
         lines.append(f"⚠ {w}")
 
     if n_images == 0:
         lines.append("")
-        lines.append("❌ Cannot configure — no images found.")
-        return "\n".join(lines), "", ""
+        lines.append(t("info_no_images"))
+        return "\n".join(lines), "", "", "", ""
 
     # --- Step estimate ---
     batch = max(int(train_batch_size), 1)
     grad = max(int(gradient_accumulation_steps), 1)
-    spe = math.ceil((n_images * int(repeats)) / (batch * grad))
+    effective_repeats = int(repeats) if backend == "kohya" else int(dataset_repeat)
+    spe = math.ceil((n_images * effective_repeats) / (batch * grad))
     total = spe * int(max_train_epochs)
     lines.append("")
-    lines.append("── Step Estimate ─────────────────────────────────────")
-    lines.append(f"  Steps per epoch: {spe}  ({n_images} imgs × {repeats} repeats)")
-    lines.append(f"  Total steps:     {total}  ({spe} × {max_train_epochs} epochs)")
-    lines.append("──────────────────────────────────────────────────────")
+    lines.append(t("info_step_header"))
+    lines.append(t("info_step_per_epoch", n=spe, imgs=n_images, repeats=effective_repeats))
+    lines.append(t("info_step_total", n=total, spe=spe, ep=int(max_train_epochs)))
+    lines.append(t("info_step_footer"))
 
     # --- Validate models ---
     lines.append("")
-    lines.append("Checking models...")
+    lines.append(t("info_checking_models"))
     dit_model = get_dit_model_path(base_model)
     missing_models = []
     for label, path in [("DiT", dit_model), ("Qwen3", QWEN3_MODEL), ("VAE", VAE_MODEL)]:
@@ -371,67 +491,119 @@ def configure_training(
         else:
             if label == "DiT":
                 lines.append(f"  ℹ {label}: {path}")
-                lines.append(f"      (will auto-download when training starts)")
+                lines.append(t("info_will_download"))
             else:
                 lines.append(f"  ✗ {label} missing: {path}")
                 missing_models.append(label)
     if missing_models:
         lines.append("")
-        lines.append(f"❌ Missing models: {', '.join(missing_models)}")
-        lines.append("Run setup_for_linux.sh / setup_for_windows.bat to download them.")
-        return "\n".join(lines), "", ""
+        lines.append(t("info_missing_models", list=", ".join(missing_models)))
+        lines.append(t("info_run_setup"))
+        return "\n".join(lines), "", "", "", ""
 
-    # --- Generate configs ---
+    # --- Resolve TensorBoard logdir ---
+    tb_logdir = ""
+    if use_tensorboard:
+        candidate = (tb_logdir_input or "").strip()
+        if not candidate:
+            ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+            candidate = str(TB_LOGS_ROOT / f"{project_name}_{ts}")
+        Path(candidate).mkdir(parents=True, exist_ok=True)
+        tb_logdir = candidate
+        lines.append("")
+        lines.append(t("info_tb_enabled", dir=tb_logdir))
+
+    # --- Backend-specific config generation ---
     lines.append("")
-    lines.append("Generating TOML configs...")
-    try:
-        train_cfg = create_training_config(
-            project_name=project_name,
-            output_dir=output_directory,
-            dit_model_path=dit_model,
-            qwen3_model_path=QWEN3_MODEL,
-            vae_model_path=VAE_MODEL,
-            network_dim=network_dim,
-            network_alpha=network_alpha,
-            learning_rate=learning_rate,
-            max_train_epochs=max_train_epochs,
-            optimizer_type=optimizer_type,
-            lr_scheduler=lr_scheduler,
-            lr_scheduler_num_cycles=lr_scheduler_num_cycles,
-            lr_warmup_steps=lr_warmup_steps,
-            train_batch_size=train_batch_size,
-            gradient_accumulation_steps=gradient_accumulation_steps,
-            max_grad_norm=max_grad_norm,
-            save_every_n_epochs=save_every_n_epochs,
-            save_last_n_epochs=save_last_n_epochs,
-            mixed_precision=mixed_precision,
-            gradient_checkpointing=gradient_checkpointing,
-            seed=seed,
-            noise_offset=noise_offset,
-            multires_noise_discount=multires_noise_discount,
-            timestep_sampling=timestep_sampling,
-            discrete_flow_shift=discrete_flow_shift,
-            cache_latents=cache_latents,
-            cache_text_encoder_outputs=cache_text_encoder_outputs,
-            vae_chunk_size=vae_chunk_size,
-            vae_disable_cache=vae_disable_cache,
-        )
-        dataset_cfg = create_dataset_config(
-            project_name=project_name,
-            image_dir=image_directory,
-            resolution=resolution,
-            repeats=repeats,
-            caption_dropout_rate=caption_dropout,
-        )
-    except Exception as e:
-        lines.append(f"❌ Failed to generate configs: {e}")
-        return "\n".join(lines), "", ""
+    train_cfg = ""
+    dataset_cfg = ""
+    diffsynth_args_path = ""
 
-    lines.append(f"  ✓ Training config: {train_cfg}")
-    lines.append(f"  ✓ Dataset  config: {dataset_cfg}")
+    if backend == "kohya":
+        lines.append(t("info_generating_toml"))
+        try:
+            train_cfg = create_kohya_training_config(
+                project_name=project_name, output_dir=output_directory,
+                dit_model_path=dit_model, qwen3_model_path=QWEN3_MODEL, vae_model_path=VAE_MODEL,
+                network_dim=network_dim, network_alpha=network_alpha,
+                learning_rate=learning_rate, max_train_epochs=max_train_epochs,
+                optimizer_type=optimizer_type, lr_scheduler=lr_scheduler,
+                lr_scheduler_num_cycles=lr_scheduler_num_cycles, lr_warmup_steps=lr_warmup_steps,
+                train_batch_size=train_batch_size, gradient_accumulation_steps=gradient_accumulation_steps,
+                max_grad_norm=max_grad_norm,
+                save_every_n_epochs=save_every_n_epochs, save_last_n_epochs=save_last_n_epochs,
+                mixed_precision=mixed_precision, gradient_checkpointing=gradient_checkpointing,
+                seed=seed, noise_offset=noise_offset, multires_noise_discount=multires_noise_discount,
+                timestep_sampling=timestep_sampling, discrete_flow_shift=discrete_flow_shift,
+                cache_latents=cache_latents, cache_text_encoder_outputs=cache_text_encoder_outputs,
+                vae_chunk_size=vae_chunk_size, vae_disable_cache=vae_disable_cache,
+                logging_dir=tb_logdir,
+            )
+            dataset_cfg = create_dataset_config(
+                project_name=project_name, image_dir=image_directory,
+                resolution=resolution, repeats=repeats, caption_dropout_rate=caption_dropout,
+            )
+        except Exception as e:
+            lines.append(t("err_generate_failed", err=e))
+            return "\n".join(lines), "", "", "", ""
+
+        lines.append(t("info_train_cfg_written", path=train_cfg))
+        lines.append(t("info_dataset_cfg_written", path=dataset_cfg))
+
+    elif backend == "diffsynth":
+        # Verify DiffSynth-Studio exists
+        ds_dir = resolve_diffsynth_dir(diffsynth_dir)
+        ds_script = ds_dir / DIFFSYNTH_TRAIN_SCRIPT_REL
+        if not ds_script.exists():
+            lines.append("")
+            lines.append(t("err_diffsynth_missing", path=str(ds_dir)))
+            return "\n".join(lines), "", "", "", ""
+
+        lines.append(t("info_generating_metadata"))
+        try:
+            ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+            metadata_path = CONFIGS_DIR / f"{project_name}_metadata_{ts}.csv"
+            metadata_path, n_rows = generate_diffsynth_metadata(image_directory, metadata_path)
+            lines.append(t("info_metadata_written", path=str(metadata_path), n=n_rows))
+
+            _, diffsynth_args_path = create_diffsynth_training_args(
+                project_name=project_name,
+                output_dir=output_directory,
+                dit_model_path=dit_model,
+                qwen3_model_path=QWEN3_MODEL,
+                vae_model_path=VAE_MODEL,
+                image_dir=image_directory,
+                metadata_csv=str(metadata_path),
+                learning_rate=learning_rate,
+                max_train_epochs=max_train_epochs,
+                dataset_repeat=dataset_repeat,
+                max_pixels=max_pixels,
+                lora_rank=network_dim,
+                lora_target_modules=lora_target_modules,
+                use_gradient_checkpointing=gradient_checkpointing,
+                gradient_accumulation_steps=gradient_accumulation_steps,
+                save_steps=save_steps_ds,
+            )
+            lines.append(t("info_args_written", path=diffsynth_args_path))
+        except Exception as e:
+            lines.append(t("err_generate_failed", err=e))
+            return "\n".join(lines), "", "", "", ""
+
+    else:
+        lines.append(f"❌ Unknown backend: {backend}")
+        return "\n".join(lines), "", "", "", ""
 
     # --- Save all settings to config.json ---
     cfg = {
+        "backend": backend,
+        "diffsynth_dir": diffsynth_dir or "",
+        "use_tensorboard": bool(use_tensorboard),
+        "tb_port": int(tb_port),
+        "tb_logdir": tb_logdir,
+        "lora_target_modules": lora_target_modules,
+        "dataset_repeat": int(dataset_repeat),
+        "max_pixels": int(max_pixels),
+        "save_steps_ds": int(save_steps_ds),
         "project_name": project_name,
         "base_model": base_model,
         "image_directory": image_directory,
@@ -467,12 +639,56 @@ def configure_training(
         "num_cpu_threads_per_process": int(num_cpu_threads_per_process),
         "last_train_config": train_cfg,
         "last_dataset_config": dataset_cfg,
+        "last_diffsynth_args": diffsynth_args_path,
+        "last_tb_logdir": tb_logdir,
     }
     save_config(cfg)
 
     lines.append("")
-    lines.append("✓ Configuration complete — ready to train.")
-    return "\n".join(lines), train_cfg, dataset_cfg
+    lines.append(t("info_ready"))
+    return "\n".join(lines), train_cfg, dataset_cfg, diffsynth_args_path, tb_logdir
+
+
+# ---------------------------------------------------------------------------
+# DiffSynth stdout → TensorBoard loss writer
+# ---------------------------------------------------------------------------
+
+_LOSS_RE = re.compile(r"loss[=:\s]+([0-9]*\.?[0-9]+(?:[eE][+-]?\d+)?)")
+
+
+class DiffSynthLossWriter:
+    """Parse tqdm/stdout loss values and stream them to a TF events file."""
+    def __init__(self, log_dir: str):
+        self.log_dir = log_dir
+        self.step = 0
+        self.writer = None
+        Path(log_dir).mkdir(parents=True, exist_ok=True)
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+            self.writer = SummaryWriter(log_dir)
+        except Exception as e:
+            print(f"[DiffSynthLossWriter] tensorboard unavailable: {e}", file=sys.stderr)
+
+    def feed(self, line: str):
+        if self.writer is None:
+            return
+        m = _LOSS_RE.search(line)
+        if m:
+            try:
+                value = float(m.group(1))
+                if 0.0 < value < 1e6:  # filter junk matches
+                    self.writer.add_scalar("loss", value, self.step)
+                    self.step += 1
+            except ValueError:
+                pass
+
+    def close(self):
+        if self.writer is not None:
+            try:
+                self.writer.flush()
+                self.writer.close()
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -480,17 +696,17 @@ def configure_training(
 # ---------------------------------------------------------------------------
 
 def start_training(
+    backend: str,
+    diffsynth_dir: str,
     custom_config_path: str,
     gpu_index_choice: str,
     num_cpu_threads_per_process: int,
     base_model: str,
+    use_tensorboard: bool,
 ):
-    """
-    Generator: yields growing log text as training runs.
-    Uses last generated configs unless custom_config_path is provided.
-    Saves log to ./logs/
-    """
+    """Generator: yields growing log text as training runs."""
     log_lines: list[str] = []
+    backend = (backend or "kohya").lower()
 
     def emit(line: str):
         log_lines.append(line)
@@ -501,11 +717,10 @@ def start_training(
     if not dit_model.exists():
         url = BASE_MODEL_URLS.get(base_model)
         if not url:
-            yield emit(f"❌ Unknown base model: {base_model}")
+            yield emit(t("err_unknown_base_model", name=base_model))
             return
-        yield emit(f"⏳ Downloading base model '{base_model}'...")
-        yield emit(f"   This may take a few minutes. Future runs will skip this step.")
-        yield emit(f"   Destination: {dit_model}")
+        yield emit(t("info_downloading_model", name=base_model))
+        yield emit(t("info_download_destination", path=str(dit_model)))
         yield emit("")
         os.makedirs(dit_model.parent, exist_ok=True)
         try:
@@ -520,67 +735,98 @@ def start_training(
                 yield emit(line.rstrip("\n"))
             dl_proc.wait()
             if dl_proc.returncode != 0:
-                yield emit(f"❌ Download failed (exit code {dl_proc.returncode})")
+                yield emit(t("err_download_failed", code=dl_proc.returncode))
                 return
-            yield emit(f"✓ Base model downloaded successfully.")
+            yield emit(t("info_download_done"))
             yield emit("")
         except FileNotFoundError:
-            yield emit("❌ 'wget' not found. Install wget and try again.")
+            yield emit(t("err_wget_missing"))
             return
 
-    # --- Resolve config paths ---
     saved_cfg = load_config()
-
-    train_cfg = custom_config_path.strip() if custom_config_path.strip() else saved_cfg.get("last_train_config", "")
-    dataset_cfg = saved_cfg.get("last_dataset_config", "")
-
-    if not train_cfg:
-        yield emit("❌ No training config found. Run 'Configure Training' first, or provide a config path.")
-        return
-    if not Path(train_cfg).exists():
-        yield emit(f"❌ Training config not found: {train_cfg}")
-        return
-    if not dataset_cfg:
-        yield emit("❌ No dataset config found. Run 'Configure Training' first.")
-        return
-    if not Path(dataset_cfg).exists():
-        yield emit(f"❌ Dataset config not found: {dataset_cfg}")
-        return
-
-    # --- Validate sd-scripts ---
-    if not TRAIN_SCRIPT.exists():
-        yield emit(f"❌ Training script not found: {TRAIN_SCRIPT}\nRun setup_for_linux.sh / setup_for_windows.bat first.")
-        return
-
-    # --- Validate GPU ---
-    gpu_idx = gpu_index_from_choice(gpu_index_choice)
-    yield emit(f"Using GPU index: {gpu_idx}")
-
-    # --- Build accelerate command ---
     threads = max(int(num_cpu_threads_per_process), 1)
-    cmd = [
-        "accelerate", "launch",
-        "--config_file", str(ACCELERATE_CONFIG),
-        "--num_cpu_threads_per_process", str(threads),
-        "--gpu_ids", gpu_idx,
-        str(TRAIN_SCRIPT),
-        "--config_file", train_cfg,
-        "--dataset_config", dataset_cfg,
-    ]
+    gpu_idx = gpu_index_from_choice(gpu_index_choice)
+    tb_logdir = saved_cfg.get("last_tb_logdir", "")
 
-    yield emit(f"Command: {' '.join(shlex.quote(c) for c in cmd)}")
+    # --- Backend-specific command assembly ---
+    if backend == "kohya":
+        train_cfg = custom_config_path.strip() if custom_config_path.strip() else saved_cfg.get("last_train_config", "")
+        dataset_cfg = saved_cfg.get("last_dataset_config", "")
+
+        if not train_cfg:
+            yield emit(t("err_no_train_cfg"))
+            return
+        if not Path(train_cfg).exists():
+            yield emit(t("err_train_cfg_not_found", path=train_cfg))
+            return
+        if not dataset_cfg:
+            yield emit(t("err_no_dataset_cfg"))
+            return
+        if not Path(dataset_cfg).exists():
+            yield emit(t("err_dataset_cfg_not_found", path=dataset_cfg))
+            return
+        if not TRAIN_SCRIPT.exists():
+            yield emit(t("err_train_script_missing", path=str(TRAIN_SCRIPT)))
+            return
+
+        cmd = [
+            "accelerate", "launch",
+            "--config_file", str(ACCELERATE_CONFIG),
+            "--num_cpu_threads_per_process", str(threads),
+            "--gpu_ids", gpu_idx,
+            str(TRAIN_SCRIPT),
+            "--config_file", train_cfg,
+            "--dataset_config", dataset_cfg,
+        ]
+        loss_writer = None
+        cwd = str(ROOT)
+
+    elif backend == "diffsynth":
+        diffsynth_args_path = saved_cfg.get("last_diffsynth_args", "")
+        if not diffsynth_args_path or not Path(diffsynth_args_path).exists():
+            yield emit(t("err_no_train_cfg"))
+            return
+
+        try:
+            with open(diffsynth_args_path, "r", encoding="utf-8") as f:
+                ds_args = json.load(f)
+        except Exception as e:
+            yield emit(t("err_generate_failed", err=e))
+            return
+
+        ds_dir = resolve_diffsynth_dir(diffsynth_dir or saved_cfg.get("diffsynth_dir", ""))
+        ds_script = ds_dir / DIFFSYNTH_TRAIN_SCRIPT_REL
+        if not ds_script.exists():
+            yield emit(t("err_diffsynth_missing", path=str(ds_dir)))
+            return
+
+        cmd = [
+            "accelerate", "launch",
+            "--config_file", str(ACCELERATE_CONFIG),
+            "--num_cpu_threads_per_process", str(threads),
+            "--gpu_ids", gpu_idx,
+            str(ds_script),
+            *ds_args,
+        ]
+        loss_writer = DiffSynthLossWriter(tb_logdir) if use_tensorboard and tb_logdir else None
+        cwd = str(ds_dir)
+
+    else:
+        yield emit(f"❌ Unknown backend: {backend}")
+        return
+
+    yield emit(t("info_using_gpu", idx=gpu_idx))
+    yield emit(t("info_command", cmd=" ".join(shlex.quote(c) for c in cmd)))
     yield emit("")
 
-    # --- Set up log file ---
     timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     project_name = saved_cfg.get("project_name", "run")
-    log_file_path = LOGS_DIR / f"{project_name}_{timestamp}.log"
+    log_file_path = LOGS_DIR / f"{project_name}_{backend}_{timestamp}.log"
 
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = gpu_idx
     env["PYTHONUNBUFFERED"] = "1"
 
-    # --- Launch subprocess ---
     try:
         process = subprocess.Popen(
             cmd,
@@ -589,39 +835,200 @@ def start_training(
             universal_newlines=True,
             bufsize=1,
             env=env,
-            cwd=str(ROOT),
+            cwd=cwd,
             encoding="utf-8",
             errors="ignore",
         )
     except FileNotFoundError:
-        yield emit("❌ 'accelerate' not found. Make sure the venv is activated and accelerate is installed.")
+        yield emit(t("err_accelerate_missing"))
+        if loss_writer:
+            loss_writer.close()
         return
 
-    # --- Stream output ---
     with open(log_file_path, "w", encoding="utf-8", errors="ignore") as log_f:
         log_f.write(f"Command: {' '.join(cmd)}\n")
         log_f.write(f"Started: {datetime.now().isoformat()}\n\n")
-
         for line in iter(process.stdout.readline, ""):
             line = line.rstrip("\n")
             log_f.write(line + "\n")
             log_f.flush()
+            if loss_writer:
+                loss_writer.feed(line)
             yield emit(line)
 
     exit_code = process.wait()
+    if loss_writer:
+        loss_writer.close()
 
     if exit_code == 0:
-        yield emit(f"\n✓ Training completed successfully!\nLoRA saved to: {saved_cfg.get('output_directory', 'output dir')}\nLog saved to: {log_file_path}")
+        yield emit(t("info_train_done", output=saved_cfg.get("output_directory", "output dir"), log=str(log_file_path)))
     else:
-        yield emit(f"\n✗ Training failed (exit code: {exit_code})\nLog saved to: {log_file_path}")
-        # OOM hint
+        yield emit(t("info_train_failed", code=exit_code, log=str(log_file_path)))
         try:
             result = subprocess.run(["dmesg", "-T"], capture_output=True, text=True, timeout=5)
             tail = "\n".join(result.stdout.splitlines()[-40:])
-            if any(t in tail for t in ("Out of memory", "Killed process", "oom_reaper", "OOM")):
-                yield emit("\n💡 OOM detected in kernel log. Try: network_dim=8 and/or resolution=512")
+            if any(s in tail for s in ("Out of memory", "Killed process", "oom_reaper", "OOM")):
+                yield emit(t("info_oom_hint"))
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# TensorBoard server management
+# ---------------------------------------------------------------------------
+
+_tb_proc: subprocess.Popen | None = None
+_tb_lock = threading.Lock()
+_ngrok_tunnels: dict[int, object] = {}
+_ngrok_lock = threading.Lock()
+
+
+def _port_alive(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.5)
+        return s.connect_ex(("127.0.0.1", int(port))) == 0
+
+
+def start_ngrok_tunnel(port: int, token: str) -> tuple[str | None, str | None]:
+    """Open (or reuse) an ngrok HTTPS tunnel to a local port. Returns (public_url, error)."""
+    if not PYNGROK_AVAILABLE:
+        return None, t("ngrok_status_no_pyngrok")
+    token = (token or "").strip() or os.environ.get("NGROK_AUTHTOKEN", "").strip()
+    if not token:
+        return None, t("ngrok_status_no_token")
+
+    with _ngrok_lock:
+        try:
+            _ngrok.set_auth_token(token)
+            old = _ngrok_tunnels.pop(int(port), None)
+            if old is not None:
+                try:
+                    _ngrok.disconnect(old.public_url)
+                except Exception:
+                    pass
+            tunnel = _ngrok.connect(int(port), "http", bind_tls=True)
+            _ngrok_tunnels[int(port)] = tunnel
+            url = tunnel.public_url
+            if url.startswith("http://"):
+                url = "https://" + url[len("http://"):]
+            return url, None
+        except Exception as e:
+            return None, t("ngrok_status_tunnel_failed", err=e)
+
+
+def stop_ngrok_tunnels():
+    if not PYNGROK_AVAILABLE:
+        return
+    with _ngrok_lock:
+        for port, tunnel in list(_ngrok_tunnels.items()):
+            try:
+                _ngrok.disconnect(tunnel.public_url)
+            except Exception:
+                pass
+            _ngrok_tunnels.pop(port, None)
+        try:
+            _ngrok.kill()
+        except Exception:
+            pass
+
+
+atexit.register(stop_ngrok_tunnels)
+
+
+def start_tensorboard(
+    log_dir: str, port: int,
+    use_ngrok: bool = False, ngrok_token: str = "",
+) -> tuple[str, str]:
+    """Returns (status_message, iframe_html). When use_ngrok is True, also opens an ngrok tunnel."""
+    global _tb_proc
+    port = int(port) if port else 6006
+
+    if not log_dir or not log_dir.strip():
+        return t("tb_status_no_logdir"), _empty_iframe()
+    if not Path(log_dir).exists():
+        return t("tb_status_no_logdir"), _empty_iframe()
+
+    # When tunneling, TB must bind to all interfaces so ngrok can reach it.
+    bind_host = "0.0.0.0" if use_ngrok else "127.0.0.1"
+
+    with _tb_lock:
+        if _tb_proc is None or _tb_proc.poll() is not None:
+            try:
+                _tb_proc = subprocess.Popen(
+                    [sys.executable, "-m", "tensorboard.main",
+                     "--logdir", log_dir,
+                     "--port", str(port),
+                     "--host", bind_host,
+                     "--reload_interval", "5"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except FileNotFoundError as e:
+                return t("tb_status_failed", err=e), _empty_iframe()
+
+            for _ in range(60):
+                if _port_alive(port):
+                    break
+                time.sleep(0.5)
+            else:
+                return t("tb_status_failed", err="timeout waiting for port"), _empty_iframe()
+            already_running = False
+        else:
+            already_running = True
+
+    local_url = f"http://127.0.0.1:{port}"
+    status_lines: list[str] = []
+    if already_running:
+        status_lines.append(t("tb_status_already", url=local_url))
+    else:
+        status_lines.append(t("tb_status_running", url=local_url))
+
+    if use_ngrok:
+        public_url, err = start_ngrok_tunnel(port, ngrok_token)
+        if public_url:
+            status_lines.append(t("ngrok_status_tunnel_open", url=public_url))
+            return "\n\n".join(status_lines), _iframe_for(public_url, local_url)
+        else:
+            status_lines.append(err or t("tb_status_failed", err="ngrok"))
+            # Fall back to local URL — useful when running locally even if user accidentally toggled ngrok
+            return "\n\n".join(status_lines), _iframe_for(local_url)
+
+    return "\n\n".join(status_lines), _iframe_for(local_url)
+
+
+def stop_tensorboard() -> tuple[str, str]:
+    global _tb_proc
+    with _tb_lock:
+        if _tb_proc is not None and _tb_proc.poll() is None:
+            _tb_proc.terminate()
+            try:
+                _tb_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                _tb_proc.kill()
+        _tb_proc = None
+    stop_ngrok_tunnels()
+    return t("tb_status_stopped"), _empty_iframe()
+
+
+def _iframe_for(url: str, alt_url: str | None = None) -> str:
+    alt_block = ""
+    if alt_url and alt_url != url:
+        alt_block = (
+            f' · <a href="{alt_url}" target="_blank" rel="noopener noreferrer">'
+            f'{t("btn_open_local")}</a>'
+        )
+    return (
+        f'<div style="border:1px solid #ccc;border-radius:6px;overflow:hidden;">'
+        f'<iframe src="{url}" width="100%" height="800" style="border:0;"></iframe>'
+        f'<div style="padding:6px;font-size:13px;">'
+        f'🔗 <a href="{url}" target="_blank" rel="noopener noreferrer">{t("btn_open_tb")}</a>'
+        f'{alt_block}'
+        f'</div></div>'
+    )
+
+
+def _empty_iframe() -> str:
+    return f'<div style="padding:30px;text-align:center;color:#888;">{t("tb_view_placeholder")}</div>'
 
 
 # ---------------------------------------------------------------------------
@@ -630,293 +1037,269 @@ def start_training(
 
 def build_ui() -> gr.Blocks:
     cfg = load_config()
+    current_lang = get_lang()
 
-    # Resolve saved GPU choice label
     saved_gpu_idx = str(cfg.get("gpu_index", "0"))
     default_gpu = next(
         (c for c in GPU_CHOICES if c.startswith(saved_gpu_idx + ":")),
         GPU_CHOICES[0] if GPU_CHOICES else "0",
     )
 
-    with gr.Blocks(title="Anima LoRA Trainer") as demo:
-        gr.Markdown(
-            """# 🍋 Citron's Anima LoRA Trainer
+    is_diffsynth = cfg.get("backend", "kohya") == "diffsynth"
 
-    Super Simple Gradio UI for training LoRA adapters on the <a href="https://huggingface.co/circlestone-labs/Anima" target="_blank" rel="noopener noreferrer">Anima</a> diffusion model using <a href="https://github.com/kohya-ss/sd-scripts" target="_blank" rel="noopener noreferrer">kohya-ss/sd-scripts</a>.
+    with gr.Blocks(title=t("app_title")) as demo:
+        gr.Markdown(t("header_markdown"))
 
-    🚀 Runs on ~6 GB VRAM with default settings. 
+        # ── Language + Backend top bar ───────────────────────────────────
+        with gr.Row():
+            language_dd = gr.Dropdown(
+                label=t("language"),
+                choices=SUPPORTED_LANGS,
+                value=current_lang,
+                info=t("language_info"),
+                scale=1,
+            )
+            save_lang_btn = gr.Button(t("btn_save_language"), scale=0)
+            backend_radio = gr.Radio(
+                label=t("backend"),
+                choices=["kohya", "diffsynth"],
+                value=cfg.get("backend", "kohya"),
+                info=t("backend_info"),
+                scale=2,
+            )
 
-    Created by <a href="https://x.com/Citron_Legacy" target="_blank" rel="noopener noreferrer">Citron Legacy</a>  Please check out the <a href="https://github.com/citronlegacy/citron-anima-lora-trainer-ui" target="_blank" rel="noopener noreferrer">Code in Git</a>
-    """
-        )
+        language_status = gr.Markdown("")
 
-        # ── Shared state for last-generated config paths ──────────────────
+        # ── Shared state for last-generated config paths ────────────────
         last_train_cfg = gr.State(cfg.get("last_train_config", ""))
         last_dataset_cfg = gr.State(cfg.get("last_dataset_config", ""))
+        last_diffsynth_args = gr.State(cfg.get("last_diffsynth_args", ""))
+        last_tb_logdir_state = gr.State(cfg.get("last_tb_logdir", ""))
 
         with gr.Tabs():
 
             # ================================================================
             # TAB 1 — Training
             # ================================================================
-            with gr.Tab("Training"):
+            with gr.Tab(t("tab_training")):
 
                 with gr.Group():
-                    gr.Markdown("### Project & Paths")
+                    gr.Markdown(f"### {t('section_project_paths')}")
                     with gr.Row():
-                        project_name = gr.Textbox(
-                            label="Project Name",
-                            value=cfg["project_name"],
-                            placeholder="my_lora",
-                        )
-                        gpu_dropdown = gr.Dropdown(
-                            label="GPU",
-                            choices=GPU_CHOICES,
-                            value=default_gpu,
-                        )
+                        project_name = gr.Textbox(label=t("project_name"), value=cfg["project_name"], placeholder="my_lora")
+                        gpu_dropdown = gr.Dropdown(label=t("gpu"), choices=GPU_CHOICES, value=default_gpu)
                     with gr.Row():
                         base_model_dropdown = gr.Dropdown(
-                            label="Base Model",
+                            label=t("base_model"),
                             choices=["anima-base-v1.0", "anima-preview3-base", "anima-preview"],
                             value=cfg.get("base_model", "anima-base-v1.0"),
-                            info="Select Base Model (Model will auto download when you click start training. this may take a few minutes but future runs will not need to download.)",
+                            info=t("base_model_info"),
                         )
                     image_directory = gr.Textbox(
-                        label="Image Directory (flat folder with images + .txt captions)",
+                        label=t("image_directory"),
                         value=cfg["image_directory"],
                         placeholder="/path/to/my_dataset",
                     )
                     output_directory = gr.Textbox(
-                        label="Output Directory (where trained LoRA is saved)",
+                        label=t("output_directory"),
                         value=cfg["output_directory"],
                         placeholder="/path/to/output",
                     )
 
                 with gr.Group():
-                    gr.Markdown("### Network")
+                    gr.Markdown(f"### {t('section_network')}")
                     with gr.Row():
-                        network_dim = gr.Number(
-                            label="Network Dim",
-                            value=cfg["network_dim"],
-                            precision=0,
-                            minimum=1,
-                        )
-                        network_alpha = gr.Number(
-                            label="Network Alpha",
-                            value=cfg["network_alpha"],
-                            precision=0,
-                            minimum=1,
-                        )
-                        learning_rate = gr.Number(
-                            label="Learning Rate",
-                            value=cfg["learning_rate"],
-                        )
-                        max_train_epochs = gr.Number(
-                            label="Max Epochs",
-                            value=cfg["max_train_epochs"],
-                            precision=0,
-                            minimum=1,
-                        )
+                        network_dim = gr.Number(label=t("network_dim"), value=cfg["network_dim"], precision=0, minimum=1)
+                        network_alpha = gr.Number(label=t("network_alpha"), value=cfg["network_alpha"], precision=0, minimum=1)
+                        learning_rate = gr.Number(label=t("learning_rate"), value=cfg["learning_rate"])
+                        max_train_epochs = gr.Number(label=t("max_epochs"), value=cfg["max_train_epochs"], precision=0, minimum=1)
 
                 with gr.Group():
-                    gr.Markdown("### Dataset")
+                    gr.Markdown(f"### {t('section_dataset')}")
                     with gr.Row():
-                        resolution = gr.Number(
-                            label="Resolution (px)",
-                            value=cfg["resolution"],
-                            precision=0,
-                            minimum=64,
-                        )
-                        repeats = gr.Number(
-                            label="Repeats",
-                            value=cfg["repeats"],
-                            precision=0,
-                            minimum=1,
-                        )
-                        caption_dropout = gr.Slider(
-                            label="Caption Dropout",
-                            minimum=0.0,
-                            maximum=1.0,
-                            step=0.05,
-                            value=cfg["caption_dropout"],
-                        )
+                        resolution = gr.Number(label=t("resolution"), value=cfg["resolution"], precision=0, minimum=64)
+                        repeats = gr.Number(label=t("repeats"), value=cfg["repeats"], precision=0, minimum=1)
+                        caption_dropout = gr.Slider(label=t("caption_dropout"), minimum=0.0, maximum=1.0, step=0.05, value=cfg["caption_dropout"])
 
                 gr.Markdown("---")
-                gr.Markdown("### Config & Training")
+                gr.Markdown(f"### {t('section_config_training')}")
 
                 with gr.Row():
-                    configure_btn = gr.Button("⚙️ Configure Training", variant="secondary", size="lg")
-                    train_btn = gr.Button("🚀 Start Training", variant="primary", size="lg")
+                    configure_btn = gr.Button(t("btn_configure"), variant="secondary", size="lg")
+                    train_btn = gr.Button(t("btn_start"), variant="primary", size="lg")
 
                 custom_config_input = gr.Textbox(
-                    label="Override Training Config Path (optional — leave blank to use last generated)",
+                    label=t("override_config_label"),
                     value="",
                     placeholder="/path/to/custom_training_config.toml",
                 )
 
-                status_box = gr.Textbox(
-                    label="Configuration Status",
-                    lines=12,
-                    interactive=False,
-                    show_copy_button=True,
-                )
-
-                log_box = gr.Textbox(
-                    label="Training Log",
-                    lines=25,
-                    interactive=False,
-                    show_copy_button=True,
-                    autoscroll=True,
-                )
+                status_box = gr.Textbox(label=t("status_label"), lines=14, interactive=False, show_copy_button=True)
+                log_box = gr.Textbox(label=t("log_label"), lines=25, interactive=False, show_copy_button=True, autoscroll=True)
 
             # ================================================================
             # TAB 2 — Advanced Settings
             # ================================================================
-            with gr.Tab("Advanced Settings"):
+            with gr.Tab(t("tab_advanced")):
                 gr.Markdown(
-                    "_These settings are applied when you click **Configure Training**._\n\n"
-                    "Defaults match the original notebook."
+                    "_These settings are applied when you click "
+                    f"**{t('btn_configure')}**._"
                 )
 
-                with gr.Group():
-                    gr.Markdown("### Optimizer & Scheduler")
+                # DiffSynth-specific group (visible only when backend == diffsynth)
+                with gr.Group(visible=is_diffsynth) as diffsynth_group:
+                    gr.Markdown(f"### {t('section_diffsynth')}")
+                    gr.Markdown(t("diffsynth_lr_note"))
+                    with gr.Row():
+                        lora_target_modules_in = gr.Textbox(
+                            label=t("lora_target_modules"),
+                            value=cfg["lora_target_modules"],
+                            info=t("lora_target_modules_info"),
+                        )
+                    with gr.Row():
+                        dataset_repeat_in = gr.Number(label=t("dataset_repeat"), value=cfg["dataset_repeat"], precision=0, minimum=1)
+                        max_pixels_in = gr.Number(label=t("max_pixels"), value=cfg["max_pixels"], precision=0, minimum=65536)
+                        save_steps_ds_in = gr.Number(
+                            label=t("save_steps_ds"), value=cfg["save_steps_ds"],
+                            precision=0, minimum=0, info=t("save_steps_ds_info"),
+                        )
+                    diffsynth_dir_in = gr.Textbox(
+                        label=t("diffsynth_dir"),
+                        value=cfg["diffsynth_dir"],
+                        placeholder=str(DIFFSYNTH_DEFAULT_DIR),
+                        info=t("diffsynth_dir_info"),
+                    )
+
+                # Kohya-specific groups (visible only when backend == kohya)
+                with gr.Group(visible=not is_diffsynth) as kohya_optimizer_group:
+                    gr.Markdown(f"### {t('section_optimizer')}")
                     with gr.Row():
                         optimizer_type = gr.Dropdown(
-                            label="Optimizer",
+                            label=t("optimizer"),
                             choices=["AdamW8bit", "AdamW", "Lion", "SGD", "Prodigy"],
                             value=cfg["optimizer_type"],
                         )
                         lr_scheduler = gr.Dropdown(
-                            label="LR Scheduler",
-                            choices=[
-                                "cosine_with_restarts",
-                                "cosine",
-                                "linear",
-                                "constant",
-                                "constant_with_warmup",
-                                "polynomial",
-                            ],
+                            label=t("lr_scheduler"),
+                            choices=["cosine_with_restarts", "cosine", "linear", "constant", "constant_with_warmup", "polynomial"],
                             value=cfg["lr_scheduler"],
                         )
                     with gr.Row():
-                        lr_scheduler_num_cycles = gr.Number(
-                            label="LR Scheduler Num Cycles",
-                            value=cfg["lr_scheduler_num_cycles"],
-                            precision=0,
-                            minimum=1,
-                        )
-                        lr_warmup_steps = gr.Number(
-                            label="LR Warmup Steps",
-                            value=cfg["lr_warmup_steps"],
-                            precision=0,
-                            minimum=0,
-                        )
+                        lr_scheduler_num_cycles = gr.Number(label=t("lr_scheduler_cycles"), value=cfg["lr_scheduler_num_cycles"], precision=0, minimum=1)
+                        lr_warmup_steps = gr.Number(label=t("lr_warmup_steps"), value=cfg["lr_warmup_steps"], precision=0, minimum=0)
 
                 with gr.Group():
-                    gr.Markdown("### Batch & Gradient")
+                    gr.Markdown(f"### {t('section_batch')}")
                     with gr.Row():
-                        train_batch_size = gr.Number(
-                            label="Train Batch Size",
-                            value=cfg["train_batch_size"],
-                            precision=0,
-                            minimum=1,
-                        )
-                        gradient_accumulation_steps = gr.Number(
-                            label="Gradient Accumulation Steps",
-                            value=cfg["gradient_accumulation_steps"],
-                            precision=0,
-                            minimum=1,
-                        )
-                        max_grad_norm = gr.Number(
-                            label="Max Grad Norm",
-                            value=cfg["max_grad_norm"],
-                        )
+                        train_batch_size = gr.Number(label=t("train_batch_size"), value=cfg["train_batch_size"], precision=0, minimum=1)
+                        gradient_accumulation_steps = gr.Number(label=t("grad_accum_steps"), value=cfg["gradient_accumulation_steps"], precision=0, minimum=1)
+                        max_grad_norm = gr.Number(label=t("max_grad_norm"), value=cfg["max_grad_norm"])
+
+                with gr.Group(visible=not is_diffsynth) as kohya_saving_group:
+                    gr.Markdown(f"### {t('section_saving')}")
+                    with gr.Row():
+                        save_every_n_epochs = gr.Number(label=t("save_every_n_epochs"), value=cfg["save_every_n_epochs"], precision=0, minimum=1)
+                        save_last_n_epochs = gr.Number(label=t("save_last_n"), value=cfg["save_last_n_epochs"], precision=0, minimum=1)
 
                 with gr.Group():
-                    gr.Markdown("### Saving")
+                    gr.Markdown(f"### {t('section_precision')}")
                     with gr.Row():
-                        save_every_n_epochs = gr.Number(
-                            label="Save Every N Epochs",
-                            value=cfg["save_every_n_epochs"],
-                            precision=0,
-                            minimum=1,
-                        )
-                        save_last_n_epochs = gr.Number(
-                            label="Keep Last N Checkpoints",
-                            value=cfg["save_last_n_epochs"],
-                            precision=0,
-                            minimum=1,
-                        )
+                        mixed_precision = gr.Dropdown(label=t("mixed_precision"), choices=["bf16", "fp16", "no"], value=cfg["mixed_precision"])
+                        vae_chunk_size = gr.Number(label=t("vae_chunk_size"), value=cfg["vae_chunk_size"], precision=0, minimum=1, visible=not is_diffsynth)
+                    with gr.Row():
+                        gradient_checkpointing = gr.Checkbox(label=t("gradient_checkpointing"), value=cfg["gradient_checkpointing"])
+                        cache_latents = gr.Checkbox(label=t("cache_latents"), value=cfg["cache_latents"], visible=not is_diffsynth)
+                        cache_text_encoder_outputs = gr.Checkbox(label=t("cache_text_encoder"), value=cfg["cache_text_encoder_outputs"], visible=not is_diffsynth)
+                        vae_disable_cache = gr.Checkbox(label=t("vae_disable_cache"), value=cfg["vae_disable_cache"], visible=not is_diffsynth)
+
+                with gr.Group(visible=not is_diffsynth) as kohya_noise_group:
+                    gr.Markdown(f"### {t('section_noise')}")
+                    with gr.Row():
+                        noise_offset = gr.Number(label=t("noise_offset"), value=cfg["noise_offset"])
+                        multires_noise_discount = gr.Number(label=t("multires_noise_discount"), value=cfg["multires_noise_discount"])
+                        timestep_sampling = gr.Dropdown(label=t("timestep_sampling"), choices=["sigmoid", "uniform", "logit_normal"], value=cfg["timestep_sampling"])
+                        discrete_flow_shift = gr.Number(label=t("discrete_flow_shift"), value=cfg["discrete_flow_shift"])
 
                 with gr.Group():
-                    gr.Markdown("### Precision & Memory")
+                    gr.Markdown(f"### {t('section_misc')}")
                     with gr.Row():
-                        mixed_precision = gr.Dropdown(
-                            label="Mixed Precision",
-                            choices=["bf16", "fp16", "no"],
-                            value=cfg["mixed_precision"],
-                        )
-                        vae_chunk_size = gr.Number(
-                            label="VAE Chunk Size",
-                            value=cfg["vae_chunk_size"],
-                            precision=0,
-                            minimum=1,
-                        )
-                    with gr.Row():
-                        gradient_checkpointing = gr.Checkbox(
-                            label="Gradient Checkpointing",
-                            value=cfg["gradient_checkpointing"],
-                        )
-                        cache_latents = gr.Checkbox(
-                            label="Cache Latents",
-                            value=cfg["cache_latents"],
-                        )
-                        cache_text_encoder_outputs = gr.Checkbox(
-                            label="Cache Text Encoder Outputs",
-                            value=cfg["cache_text_encoder_outputs"],
-                        )
-                        vae_disable_cache = gr.Checkbox(
-                            label="VAE Disable Cache",
-                            value=cfg["vae_disable_cache"],
-                        )
+                        seed = gr.Number(label=t("seed"), value=cfg["seed"], precision=0)
+                        num_cpu_threads = gr.Number(label=t("cpu_threads"), value=cfg["num_cpu_threads_per_process"], precision=0, minimum=1)
+
+            # ================================================================
+            # TAB 3 — TensorBoard
+            # ================================================================
+            with gr.Tab(t("tab_tensorboard")):
+                gr.Markdown(f"### {t('section_tb_settings')}")
+                with gr.Row():
+                    use_tb_chk = gr.Checkbox(label=t("tb_use"), value=cfg["use_tensorboard"], info=t("tb_use_info"))
+                    tb_port_in = gr.Number(label=t("tb_port"), value=cfg["tb_port"], precision=0, minimum=1024)
+                tb_logdir_in = gr.Textbox(
+                    label=t("tb_logdir"),
+                    value=cfg.get("last_tb_logdir", "") or cfg.get("tb_logdir", ""),
+                    info=t("tb_logdir_info"),
+                    placeholder=str(TB_LOGS_ROOT / "<project>_<timestamp>"),
+                )
 
                 with gr.Group():
-                    gr.Markdown("### Noise & Flow")
-                    with gr.Row():
-                        noise_offset = gr.Number(
-                            label="Noise Offset",
-                            value=cfg["noise_offset"],
-                        )
-                        multires_noise_discount = gr.Number(
-                            label="Multires Noise Discount",
-                            value=cfg["multires_noise_discount"],
-                        )
-                        timestep_sampling = gr.Dropdown(
-                            label="Timestep Sampling",
-                            choices=["sigmoid", "uniform", "logit_normal"],
-                            value=cfg["timestep_sampling"],
-                        )
-                        discrete_flow_shift = gr.Number(
-                            label="Discrete Flow Shift",
-                            value=cfg["discrete_flow_shift"],
-                        )
+                    gr.Markdown(f"### {t('section_sharing')}")
+                    if IS_COLAB:
+                        gr.Markdown(t("info_colab_detected"))
+                    if not PYNGROK_AVAILABLE:
+                        gr.Markdown(t("ngrok_status_no_pyngrok"))
+                    ngrok_enable_chk = gr.Checkbox(
+                        label=t("ngrok_enable"),
+                        value=bool(cfg.get("ngrok_enable", False)) or IS_COLAB,
+                        info=t("ngrok_enable_info"),
+                    )
+                    ngrok_token_in = gr.Textbox(
+                        label=t("ngrok_token"),
+                        value=cfg.get("ngrok_token", ""),
+                        type="password",
+                        info=t("ngrok_token_info"),
+                        placeholder="2x...your token...",
+                    )
 
-                with gr.Group():
-                    gr.Markdown("### Misc")
-                    with gr.Row():
-                        seed = gr.Number(
-                            label="Seed",
-                            value=cfg["seed"],
-                            precision=0,
-                        )
-                        num_cpu_threads = gr.Number(
-                            label="CPU Threads Per Process",
-                            value=cfg["num_cpu_threads_per_process"],
-                            precision=0,
-                            minimum=1,
-                        )
+                with gr.Row():
+                    start_tb_btn = gr.Button(t("btn_start_tb"), variant="primary")
+                    stop_tb_btn = gr.Button(t("btn_stop_tb"), variant="stop")
+                tb_status_md = gr.Markdown(t("tb_status_stopped"))
+                tb_iframe = gr.HTML(_empty_iframe())
 
-        # ── All advanced inputs collected for passing to configure_training ─
+        # ── Backend visibility toggling ──────────────────────────────────
+        def _toggle_backend(backend_value: str):
+            ds = backend_value == "diffsynth"
+            return (
+                gr.update(visible=ds),         # diffsynth_group
+                gr.update(visible=not ds),     # kohya_optimizer_group
+                gr.update(visible=not ds),     # kohya_saving_group
+                gr.update(visible=not ds),     # kohya_noise_group
+                gr.update(visible=not ds),     # vae_chunk_size
+                gr.update(visible=not ds),     # cache_latents
+                gr.update(visible=not ds),     # cache_text_encoder
+                gr.update(visible=not ds),     # vae_disable_cache
+            )
+
+        backend_radio.change(
+            fn=_toggle_backend,
+            inputs=[backend_radio],
+            outputs=[
+                diffsynth_group, kohya_optimizer_group, kohya_saving_group,
+                kohya_noise_group, vae_chunk_size, cache_latents,
+                cache_text_encoder_outputs, vae_disable_cache,
+            ],
+        )
+
+        # ── Language save ────────────────────────────────────────────────
+        def _save_language(lang: str):
+            if lang in SUPPORTED_LANGS:
+                set_lang(lang)
+                return t("language_saved", lang=lang)
+            return ""
+
+        save_lang_btn.click(fn=_save_language, inputs=[language_dd], outputs=[language_status])
+
+        # ── Input groups ─────────────────────────────────────────────────
         adv_inputs = [
             optimizer_type, lr_scheduler, lr_scheduler_num_cycles, lr_warmup_steps,
             train_batch_size, gradient_accumulation_steps, max_grad_norm,
@@ -926,26 +1309,46 @@ def build_ui() -> gr.Blocks:
             cache_latents, cache_text_encoder_outputs, vae_chunk_size, vae_disable_cache,
             num_cpu_threads,
         ]
-
         basic_inputs = [
             project_name, base_model_dropdown, image_directory, output_directory,
             network_dim, network_alpha, learning_rate, max_train_epochs,
             resolution, repeats, caption_dropout, gpu_dropdown,
         ]
+        diffsynth_inputs = [lora_target_modules_in, dataset_repeat_in, max_pixels_in, save_steps_ds_in]
+        tb_inputs = [use_tb_chk, tb_logdir_in, tb_port_in]
 
         # ── Configure Training event ─────────────────────────────────────
         configure_btn.click(
             fn=configure_training,
-            inputs=basic_inputs + adv_inputs,
-            outputs=[status_box, last_train_cfg, last_dataset_cfg],
+            inputs=[backend_radio, diffsynth_dir_in] + basic_inputs + adv_inputs + diffsynth_inputs + tb_inputs,
+            outputs=[status_box, last_train_cfg, last_dataset_cfg, last_diffsynth_args, last_tb_logdir_state],
         )
 
-        # ── Start Training event (generator → streaming) ─────────────────
+        # ── Start Training event ─────────────────────────────────────────
         train_btn.click(
             fn=start_training,
-            inputs=[custom_config_input, gpu_dropdown, num_cpu_threads, base_model_dropdown],
+            inputs=[backend_radio, diffsynth_dir_in, custom_config_input, gpu_dropdown, num_cpu_threads, base_model_dropdown, use_tb_chk],
             outputs=[log_box],
         )
+
+        # ── TensorBoard control ──────────────────────────────────────────
+        def _start_tb_handler(logdir, port, state_logdir, use_ngrok, ngrok_token):
+            # Prefer explicit input, else fall back to last run's logdir
+            effective = (logdir or "").strip() or (state_logdir or "")
+            # Persist ngrok prefs so the user doesn't need to retype the token
+            save_config({
+                "ngrok_enable": bool(use_ngrok),
+                "ngrok_token": (ngrok_token or "").strip(),
+                "tb_port": int(port) if port else 6006,
+            })
+            return start_tensorboard(effective, port, use_ngrok=bool(use_ngrok), ngrok_token=ngrok_token or "")
+
+        start_tb_btn.click(
+            fn=_start_tb_handler,
+            inputs=[tb_logdir_in, tb_port_in, last_tb_logdir_state, ngrok_enable_chk, ngrok_token_in],
+            outputs=[tb_status_md, tb_iframe],
+        )
+        stop_tb_btn.click(fn=stop_tensorboard, inputs=[], outputs=[tb_status_md, tb_iframe])
 
     return demo
 
@@ -956,8 +1359,13 @@ def build_ui() -> gr.Blocks:
 
 if __name__ == "__main__":
     demo = build_ui()
-    demo.launch(
-        server_name="127.0.0.1",
-        server_port=7860,
-        show_error=True,
-    )
+    share_requested = IS_COLAB or os.environ.get("GRADIO_SHARE", "").lower() in ("1", "true", "yes")
+    launch_kwargs = {
+        "server_name": "0.0.0.0" if share_requested else "127.0.0.1",
+        "server_port": 7860,
+        "show_error": True,
+    }
+    if share_requested:
+        launch_kwargs["share"] = True
+        print(t("info_colab_detected") if IS_COLAB else t("info_gradio_share"))
+    demo.launch(**launch_kwargs)

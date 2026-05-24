@@ -84,6 +84,30 @@ pip install torch==2.9.1+cu128 torchvision torchaudio --index-url https://downlo
 echo       PyTorch cu128 confirmed.
 
 :: -----------------------------------------------------------------------------
+:: 4b. (Optional) Clone & install DiffSynth-Studio for the DiffSynth backend.
+::     Skip with: set SKIP_DIFFSYNTH=1 before running this script.
+:: -----------------------------------------------------------------------------
+echo.
+if "%SKIP_DIFFSYNTH%"=="1" (
+    echo [4b/7] Skipping DiffSynth-Studio install (SKIP_DIFFSYNTH=1).
+) else (
+    if not exist "DiffSynth-Studio" (
+        echo [4b/7] Cloning DiffSynth-Studio (optional alternative backend)...
+        git clone https://github.com/modelscope/DiffSynth-Studio.git
+        if errorlevel 1 (
+            echo WARN: DiffSynth-Studio clone failed. The kohya backend will still work.
+        ) else (
+            pushd DiffSynth-Studio
+            pip install -e .
+            popd
+            echo       DiffSynth-Studio installed.
+        )
+    ) else (
+        echo [4b/7] DiffSynth-Studio already present -- skipping clone.
+    )
+)
+
+:: -----------------------------------------------------------------------------
 :: 5. Install app requirements (gradio, toml)
 :: -----------------------------------------------------------------------------
 echo.

@@ -59,6 +59,30 @@ popd
 echo       sd-scripts requirements installed.
 
 :: -----------------------------------------------------------------------------
+:: 3b. (Optional) Clone & install DiffSynth-Studio for the DiffSynth backend.
+::     Skip with: set SKIP_DIFFSYNTH=1 before running this script.
+:: -----------------------------------------------------------------------------
+echo.
+if "%SKIP_DIFFSYNTH%"=="1" (
+    echo [3b/6] Skipping DiffSynth-Studio install (SKIP_DIFFSYNTH=1).
+) else (
+    if not exist "DiffSynth-Studio" (
+        echo [3b/6] Cloning DiffSynth-Studio (optional alternative backend)...
+        git clone https://github.com/modelscope/DiffSynth-Studio.git
+        if errorlevel 1 (
+            echo WARN: DiffSynth-Studio clone failed. The kohya backend will still work.
+        ) else (
+            pushd DiffSynth-Studio
+            pip install -e .
+            popd
+            echo       DiffSynth-Studio installed.
+        )
+    ) else (
+        echo [3b/6] DiffSynth-Studio already present -- skipping clone.
+    )
+)
+
+:: -----------------------------------------------------------------------------
 :: 4a. Install correct PyTorch for RTX 50-series (sm_120 / CUDA 12.8)
 ::     sd-scripts requirements may pull a generic torch without sm_120 support.
 ::     We explicitly reinstall from the cu128 index.
