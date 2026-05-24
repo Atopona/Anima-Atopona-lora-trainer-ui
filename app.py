@@ -48,6 +48,7 @@ SD_SCRIPTS_DIR = ROOT / "sd-scripts"
 DIFFSYNTH_DEFAULT_DIR = ROOT / "DiffSynth-Studio"
 DIFFSYNTH_GIT_URL = "https://github.com/modelscope/DiffSynth-Studio.git"
 DIFFSYNTH_LEGACY_ANIMA_TARGET_MODULES = "q,k,v,o,ffn.0,ffn.2"
+DIFFSYNTH_TENSORBOARD_WRAPPER = ROOT / "tools" / "diffsynth_tensorboard_wrapper.py"
 TORCHAO_MIN_EXCLUSIVE_VERSION = (0, 16, 0)
 TORCHAO_PIP_SPEC = "torchao>0.16.0"
 
@@ -818,15 +819,24 @@ def configure_training(
         return "\n".join(lines), "", "", "", ""
 
     # --- Step estimate ---
-    batch = max(int(train_batch_size), 1)
-    grad = max(int(gradient_accumulation_steps), 1)
-    effective_repeats = int(repeats) if backend == "kohya" else int(dataset_repeat)
-    spe = math.ceil((n_images * effective_repeats) / (batch * grad))
+    if backend == "diffsynth":
+        # DiffSynth's training progress is based on the repeated dataset length.
+        # Batch size is controlled by its trainer, so using Kohya's batch formula
+        # makes the UI estimate smaller than the actual tqdm total.
+        effective_repeats = int(dataset_repeat)
+        spe = n_images * effective_repeats
+    else:
+        batch = max(int(train_batch_size), 1)
+        grad = max(int(gradient_accumulation_steps), 1)
+        effective_repeats = int(repeats)
+        spe = math.ceil((n_images * effective_repeats) / (batch * grad))
     total = spe * int(max_train_epochs)
     lines.append("")
     lines.append(t("info_step_header"))
     lines.append(t("info_step_per_epoch", n=spe, imgs=n_images, repeats=effective_repeats))
     lines.append(t("info_step_total", n=total, spe=spe, ep=int(max_train_epochs)))
+    if backend == "diffsynth":
+        lines.append(t("info_step_diffsynth_note"))
     lines.append(t("info_step_footer"))
 
     # --- Validate models ---
@@ -1166,15 +1176,28 @@ def start_training(
             yield emit(t("err_diffsynth_missing", path=str(ds_dir)))
             return
 
+        train_entrypoint = str(ds_script)
+        train_args = [*ds_args]
+        loss_writer = None
+        if use_tensorboard and tb_logdir:
+            if DIFFSYNTH_TENSORBOARD_WRAPPER.exists():
+                train_entrypoint = str(DIFFSYNTH_TENSORBOARD_WRAPPER)
+                train_args = [
+                    "--diffsynth-train-script", str(ds_script),
+                    "--tensorboard-logdir", str(tb_logdir),
+                    *ds_args,
+                ]
+            else:
+                loss_writer = DiffSynthLossWriter(tb_logdir)
+
         cmd = [
             *accelerate_launch,
             "--config_file", str(ACCELERATE_CONFIG),
             "--num_cpu_threads_per_process", str(threads),
             "--gpu_ids", gpu_idx,
-            str(ds_script),
-            *ds_args,
+            train_entrypoint,
+            *train_args,
         ]
-        loss_writer = DiffSynthLossWriter(tb_logdir) if use_tensorboard and tb_logdir else None
         cwd = str(ds_dir)
 
     else:
