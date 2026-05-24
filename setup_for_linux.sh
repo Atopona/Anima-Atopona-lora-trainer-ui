@@ -89,6 +89,15 @@ else
     echo "[3b/6] DiffSynth-Studio already present — skipping clone."
 fi
 
+# Make existing DiffSynth-Studio clones usable in the current venv too.
+if [ "${SKIP_DIFFSYNTH:-0}" != "1" ] && [ -d "DiffSynth-Studio" ]; then
+    echo "      Ensuring DiffSynth-Studio is installed in this venv..."
+    pushd DiffSynth-Studio > /dev/null
+    pip install -e .
+    popd > /dev/null
+    echo "      DiffSynth-Studio ready."
+fi
+
 # -----------------------------------------------------------------------------
 # 4. Install app requirements (gradio, toml)
 # -----------------------------------------------------------------------------

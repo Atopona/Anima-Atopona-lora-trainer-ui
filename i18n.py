@@ -107,13 +107,13 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "cpu_threads": "CPU Threads Per Process",
         # DiffSynth-specific
         "lora_target_modules": "LoRA Target Modules",
-        "lora_target_modules_info": "Comma-separated module names. Default works for Anima DiT.",
+        "lora_target_modules_info": "Leave blank for DiffSynth's Anima default. Custom comma-separated module names are advanced use only.",
         "dataset_repeat": "Dataset Repeat (per epoch)",
         "max_pixels": "Max Pixels (dynamic resolution)",
         "save_steps_ds": "Save Every N Steps (DiffSynth)",
         "save_steps_ds_info": "Leave 0 to save once per epoch.",
         "diffsynth_dir": "DiffSynth-Studio Directory",
-        "diffsynth_dir_info": "Path to your DiffSynth-Studio clone. Leave blank to use ./DiffSynth-Studio under project root.",
+        "diffsynth_dir_info": "Path to a DiffSynth-Studio clone. Leave blank to auto-clone/install ./DiffSynth-Studio under the project root.",
         "diffsynth_lr_note": "ℹ DiffSynth currently uses AdamW + ConstantLR — optimizer/scheduler controls don't apply.",
         # TensorBoard tab
         "tb_use": "Enable TensorBoard logging",
@@ -169,8 +169,8 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "info_dataset_cfg_written": "  ✓ Dataset  config: {path}",
         "info_ready": "✓ Configuration complete — ready to train.",
         "err_generate_failed": "❌ Failed to generate configs: {err}",
-        "err_diffsynth_missing": "❌ DiffSynth-Studio not found at: {path}\nClone it with: git clone https://github.com/modelscope/DiffSynth-Studio.git",
-        "info_diffsynth_will_install": "ℹ DiffSynth-Studio not found at {path}. It will be cloned and installed automatically when training starts.",
+        "err_diffsynth_missing": "❌ DiffSynth-Studio is not ready at: {path}\nLeave the DiffSynth directory blank, or choose an empty directory / valid DiffSynth-Studio clone.",
+        "info_diffsynth_will_install": "ℹ DiffSynth-Studio is not ready at {path}. It will be cloned/updated and installed automatically when training starts.",
         "info_diffsynth_check": "🔎 Checking DiffSynth-Studio install for the current Python interpreter...",
         "err_diffsynth_install_failed": "❌ DiffSynth-Studio install failed: {err}",
         # start_training messages
@@ -281,13 +281,13 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "cpu_threads": "每进程 CPU 线程数",
         # DiffSynth
         "lora_target_modules": "LoRA 目标模块",
-        "lora_target_modules_info": "逗号分隔的模块名。默认值适用于 Anima DiT。",
+        "lora_target_modules_info": "留空使用 DiffSynth 的 Anima 默认值。仅高级自定义时填写逗号分隔的模块名。",
         "dataset_repeat": "数据集每轮重复次数",
         "max_pixels": "最大像素数（动态分辨率）",
         "save_steps_ds": "每 N 步保存一次（DiffSynth）",
         "save_steps_ds_info": "填 0 表示仅按轮保存。",
         "diffsynth_dir": "DiffSynth-Studio 目录",
-        "diffsynth_dir_info": "DiffSynth-Studio 克隆路径。留空则使用项目根下的 ./DiffSynth-Studio。",
+        "diffsynth_dir_info": "DiffSynth-Studio 克隆路径。留空则自动克隆/安装项目根下的 ./DiffSynth-Studio。",
         "diffsynth_lr_note": "ℹ DiffSynth 目前固定使用 AdamW + ConstantLR — 优化器/调度器控件不生效。",
         # TensorBoard
         "tb_use": "启用 TensorBoard 日志",
@@ -343,8 +343,8 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "info_dataset_cfg_written": "  ✓ 数据集配置：{path}",
         "info_ready": "✓ 配置完成 — 可以开始训练。",
         "err_generate_failed": "❌ 生成配置失败：{err}",
-        "err_diffsynth_missing": "❌ 未找到 DiffSynth-Studio：{path}\n请运行：git clone https://github.com/modelscope/DiffSynth-Studio.git",
-        "info_diffsynth_will_install": "ℹ 路径 {path} 下未找到 DiffSynth-Studio。开始训练时将自动克隆并安装。",
+        "err_diffsynth_missing": "❌ DiffSynth-Studio 未就绪：{path}\n请留空 DiffSynth 目录，或选择空目录 / 有效的 DiffSynth-Studio 克隆。",
+        "info_diffsynth_will_install": "ℹ 路径 {path} 下的 DiffSynth-Studio 未就绪。开始训练时将自动克隆/更新并安装。",
         "info_diffsynth_check": "🔎 正在检查当前 Python 解释器中的 DiffSynth-Studio 安装状态...",
         "err_diffsynth_install_failed": "❌ DiffSynth-Studio 安装失败：{err}",
         # start_training

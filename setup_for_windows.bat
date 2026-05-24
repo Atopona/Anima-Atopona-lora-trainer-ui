@@ -82,6 +82,16 @@ if "%SKIP_DIFFSYNTH%"=="1" (
     )
 )
 
+if not "%SKIP_DIFFSYNTH%"=="1" (
+    if exist "DiffSynth-Studio" (
+        echo       Ensuring DiffSynth-Studio is installed in this venv...
+        pushd DiffSynth-Studio
+        pip install -e .
+        popd
+        echo       DiffSynth-Studio ready.
+    )
+)
+
 :: -----------------------------------------------------------------------------
 :: 4a. Install correct PyTorch for RTX 50-series (sm_120 / CUDA 12.8)
 ::     sd-scripts requirements may pull a generic torch without sm_120 support.

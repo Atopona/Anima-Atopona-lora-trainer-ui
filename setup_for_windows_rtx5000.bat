@@ -107,6 +107,16 @@ if "%SKIP_DIFFSYNTH%"=="1" (
     )
 )
 
+if not "%SKIP_DIFFSYNTH%"=="1" (
+    if exist "DiffSynth-Studio" (
+        echo       Ensuring DiffSynth-Studio is installed in this venv...
+        pushd DiffSynth-Studio
+        pip install -e .
+        popd
+        echo       DiffSynth-Studio ready.
+    )
+)
+
 :: -----------------------------------------------------------------------------
 :: 5. Install app requirements (gradio, toml)
 :: -----------------------------------------------------------------------------

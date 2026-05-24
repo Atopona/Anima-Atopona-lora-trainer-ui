@@ -44,6 +44,8 @@ TB_LOGS_ROOT = LOGS_DIR / "tb"
 MODELS_DIR = ROOT / "models" / "anima"
 SD_SCRIPTS_DIR = ROOT / "sd-scripts"
 DIFFSYNTH_DEFAULT_DIR = ROOT / "DiffSynth-Studio"
+DIFFSYNTH_GIT_URL = "https://github.com/modelscope/DiffSynth-Studio.git"
+DIFFSYNTH_LEGACY_ANIMA_TARGET_MODULES = "q,k,v,o,ffn.0,ffn.2"
 
 DIT_MODEL = MODELS_DIR / "dit" / "anima-preview.safetensors"
 QWEN3_MODEL = MODELS_DIR / "text_encoder" / "qwen_3_06b_base.safetensors"
@@ -91,7 +93,7 @@ DEFAULTS = {
     "ngrok_enable": False,
     "ngrok_token": "",
     # DiffSynth-specific (new)
-    "lora_target_modules": "q,k,v,o,ffn.0,ffn.2",
+    "lora_target_modules": "",
     "dataset_repeat": 50,
     "max_pixels": 1048576,
     "save_steps_ds": 0,
@@ -151,6 +153,9 @@ def load_config() -> dict:
             cfg.update({k: v for k, v in saved.items() if k in DEFAULTS})
         except Exception:
             pass
+    cfg["lora_target_modules"] = normalize_diffsynth_lora_target_modules(
+        cfg.get("lora_target_modules", "")
+    )
     return cfg
 
 
@@ -354,6 +359,27 @@ def create_dataset_config(project_name, image_dir, resolution=768, repeats=5, ca
 # DiffSynth CLI-arg generation
 # ---------------------------------------------------------------------------
 
+def normalize_diffsynth_lora_target_modules(value: str) -> str:
+    """Use DiffSynth's Anima defaults unless the user provided a custom list."""
+    normalized = (value or "").strip()
+    if normalized == DIFFSYNTH_LEGACY_ANIMA_TARGET_MODULES:
+        return ""
+    return normalized
+
+
+def migrate_diffsynth_args_for_anima(args: list[str]) -> list[str]:
+    """Repair saved DiffSynth arg files created with the old SD3/Wan target list."""
+    args = list(args)
+    try:
+        idx = args.index("--lora_target_modules")
+    except ValueError:
+        return args
+    value_idx = idx + 1
+    if value_idx < len(args):
+        args[value_idx] = normalize_diffsynth_lora_target_modules(args[value_idx])
+    return args
+
+
 def create_diffsynth_training_args(
     project_name: str, output_dir: str,
     dit_model_path: Path, qwen3_model_path: Path, vae_model_path: Path,
@@ -370,6 +396,7 @@ def create_diffsynth_training_args(
     args_path = CONFIGS_DIR / f"{project_name}_diffsynth_args_{current_date}.json"
 
     model_paths_json = json.dumps([str(dit_model_path), str(qwen3_model_path), str(vae_model_path)])
+    lora_target_modules = normalize_diffsynth_lora_target_modules(lora_target_modules)
 
     args: list[str] = [
         "--dataset_base_path", str(image_dir),
@@ -382,7 +409,7 @@ def create_diffsynth_training_args(
         "--remove_prefix_in_ckpt", "pipe.dit.",
         "--output_path", str(output_dir),
         "--lora_base_model", "dit",
-        "--lora_target_modules", lora_target_modules or "q,k,v,o,ffn.0,ffn.2",
+        "--lora_target_modules", lora_target_modules,
         "--lora_rank", str(int(lora_rank)),
         "--gradient_accumulation_steps", str(int(gradient_accumulation_steps)),
     ]
@@ -401,11 +428,7 @@ def resolve_diffsynth_dir(cfg_value: str) -> Path:
         return Path(cfg_value).expanduser()
     return DIFFSYNTH_DEFAULT_DIR
 
-
-DIFFSYNTH_GIT_URL = "https://github.com/modelscope/DiffSynth-Studio.git"
-
-
-def ensure_diffsynth_installed(diffsynth_dir: Path):
+def _ensure_diffsynth_installed_legacy(diffsynth_dir: Path):
     """Generator yielding log lines, ensuring `import diffsynth` works in `sys.executable`.
 
     Final yield is a tuple ('__done__', ok: bool, message: str).
@@ -472,6 +495,113 @@ def ensure_diffsynth_installed(diffsynth_dir: Path):
         yield ("__done__", False, f"After install, `import diffsynth` still fails:\n{check2.stderr}")
         return
     yield f"✓ DiffSynth installed at: {check2.stdout.strip()}"
+    yield ("__done__", True, "installed")
+
+
+def ensure_diffsynth_installed(diffsynth_dir: Path):
+    """Ensure a local DiffSynth-Studio checkout and an importable package exist."""
+    if diffsynth_dir.exists() and not diffsynth_dir.is_dir():
+        yield ("__done__", False, f"{diffsynth_dir} exists but is not a directory")
+        return
+
+    ds_script = diffsynth_dir / DIFFSYNTH_TRAIN_SCRIPT_REL
+
+    def stream_process(cmd: list[str], cwd: str | None = None):
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            universal_newlines=True,
+            bufsize=1,
+            cwd=cwd,
+            encoding="utf-8",
+            errors="ignore",
+        )
+        for line in iter(proc.stdout.readline, ""):
+            yield line.rstrip("\n")
+        proc.wait()
+        return proc.returncode
+
+    def clone_repo():
+        yield f"Cloning {DIFFSYNTH_GIT_URL} -> {diffsynth_dir} ..."
+        try:
+            diffsynth_dir.parent.mkdir(parents=True, exist_ok=True)
+            returncode = yield from stream_process(
+                ["git", "clone", "--depth", "1", DIFFSYNTH_GIT_URL, str(diffsynth_dir)]
+            )
+        except FileNotFoundError:
+            yield ("__done__", False, "git not found on PATH - install git and retry")
+            return
+        if returncode != 0:
+            yield ("__done__", False, f"git clone failed (exit {returncode})")
+
+    if not ds_script.exists():
+        if not diffsynth_dir.exists() or not any(diffsynth_dir.iterdir()):
+            for item in clone_repo():
+                if isinstance(item, tuple):
+                    yield item
+                    return
+                yield item
+        elif (diffsynth_dir / ".git").exists():
+            yield f"DiffSynth-Studio exists but Anima train script is missing; updating {diffsynth_dir} ..."
+            try:
+                returncode = yield from stream_process(["git", "pull", "--ff-only"], cwd=str(diffsynth_dir))
+            except FileNotFoundError:
+                yield ("__done__", False, "git not found on PATH - install git and retry")
+                return
+            if returncode != 0:
+                yield ("__done__", False, f"git pull failed (exit {returncode})")
+                return
+        else:
+            yield (
+                "__done__",
+                False,
+                f"{diffsynth_dir} exists but is missing {DIFFSYNTH_TRAIN_SCRIPT_REL}. "
+                "Choose an empty directory or a DiffSynth-Studio git clone.",
+            )
+            return
+
+    ds_script = diffsynth_dir / DIFFSYNTH_TRAIN_SCRIPT_REL
+    if not ds_script.exists():
+        yield ("__done__", False, f"DiffSynth-Studio is missing {DIFFSYNTH_TRAIN_SCRIPT_REL}")
+        return
+
+    check = subprocess.run(
+        [sys.executable, "-c", "import diffsynth; print(diffsynth.__file__)"],
+        capture_output=True,
+        text=True,
+    )
+    if check.returncode == 0:
+        imported_path = Path(check.stdout.strip()).resolve()
+        try:
+            imported_path.relative_to(diffsynth_dir.resolve())
+            yield f"DiffSynth-Studio is already installed from: {imported_path}"
+            yield ("__done__", True, "already installed")
+            return
+        except ValueError:
+            yield f"Found diffsynth at {imported_path}; reinstalling local DiffSynth-Studio checkout."
+
+    if check.returncode != 0:
+        yield f"DiffSynth-Studio not importable from {sys.executable} - installing now."
+    yield f"Running: {sys.executable} -m pip install -e {diffsynth_dir}"
+    try:
+        returncode = yield from stream_process([sys.executable, "-m", "pip", "install", "-e", str(diffsynth_dir)])
+    except FileNotFoundError:
+        yield ("__done__", False, "python or pip not found")
+        return
+    if returncode != 0:
+        yield ("__done__", False, f"pip install -e failed (exit {returncode})")
+        return
+
+    check2 = subprocess.run(
+        [sys.executable, "-c", "import diffsynth; print(diffsynth.__file__)"],
+        capture_output=True,
+        text=True,
+    )
+    if check2.returncode != 0:
+        yield ("__done__", False, f"After install, import diffsynth still fails:\n{check2.stderr}")
+        return
+    yield f"DiffSynth installed at: {check2.stdout.strip()}"
     yield ("__done__", True, "installed")
 
 
@@ -674,7 +804,7 @@ def configure_training(
         "use_tensorboard": bool(use_tensorboard),
         "tb_port": int(tb_port),
         "tb_logdir": tb_logdir,
-        "lora_target_modules": lora_target_modules,
+        "lora_target_modules": normalize_diffsynth_lora_target_modules(lora_target_modules),
         "dataset_repeat": int(dataset_repeat),
         "max_pixels": int(max_pixels),
         "save_steps_ds": int(save_steps_ds),
@@ -864,6 +994,7 @@ def start_training(
         try:
             with open(diffsynth_args_path, "r", encoding="utf-8") as f:
                 ds_args = json.load(f)
+            ds_args = migrate_diffsynth_args_for_anima(ds_args)
         except Exception as e:
             yield emit(t("err_generate_failed", err=e))
             return

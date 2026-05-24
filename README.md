@@ -125,6 +125,19 @@ mycharname, 1girl, long blonde hair, blue eyes, high quality, detailed
 6. Click **🚀 Start Training** — logs stream live into the Training Log box.
 7. Trained LoRA (`.safetensors`) is saved to your Output Directory.
 
+### DiffSynth backend
+
+The DiffSynth backend is prepared automatically. Setup scripts clone
+`DiffSynth-Studio` into `./DiffSynth-Studio` and install it into the active
+virtual environment; if it is missing or stale when training starts, the app
+will clone/update and install it again.
+
+For Anima LoRA training, leave **LoRA Target Modules** blank. The official
+DiffSynth Anima LoRA path supports LoRA training through its Anima examples,
+and an empty target-module value lets DiffSynth pick the correct Anima DiT
+layers. Older settings such as `q,k,v,o,ffn.0,ffn.2` are for other transformer
+layouts and can cause `Target modules ... not found in the base model`.
+
 ### Custom config
 
 If you have a pre-existing training TOML, paste its path into the
