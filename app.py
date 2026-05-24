@@ -9,6 +9,7 @@ import json
 import math
 import os
 import re
+import shutil
 import shlex
 import socket
 import subprocess
@@ -77,6 +78,44 @@ TB_LOGS_ROOT.mkdir(exist_ok=True, parents=True)
 # scoped to this app only. See app_configs/accelerate_gpu.yaml to change these.
 # Absolute path so cwd switching (DiffSynth backend uses ds_dir as cwd) doesn't break resolution.
 ACCELERATE_CONFIG = str(ROOT / "app_configs" / "accelerate_gpu.yaml")
+
+
+def resolve_accelerate_launch_cmd() -> list[str]:
+    """Return a working Accelerate launcher prefix."""
+    candidates: list[list[str]] = []
+    exe_dir = Path(sys.executable).resolve().parent
+
+    if os.name == "nt":
+        candidates.extend([
+            [str(exe_dir / "Scripts" / "accelerate.exe"), "launch"],
+            [str(exe_dir / "accelerate.exe"), "launch"],
+            [str(exe_dir / "Scripts" / "accelerate-launch.exe")],
+            [str(exe_dir / "accelerate-launch.exe")],
+        ])
+    else:
+        candidates.extend([
+            [str(exe_dir / "accelerate"), "launch"],
+            [str(exe_dir / "accelerate-launch")],
+        ])
+
+    path_accelerate = shutil.which("accelerate")
+    if path_accelerate:
+        candidates.append([path_accelerate, "launch"])
+
+    path_accelerate_launch = shutil.which("accelerate-launch")
+    if path_accelerate_launch:
+        candidates.append([path_accelerate_launch])
+
+    seen = set()
+    for cmd in candidates:
+        executable = cmd[0]
+        if executable in seen:
+            continue
+        seen.add(executable)
+        if Path(executable).exists():
+            return cmd
+
+    return [sys.executable, "-m", "accelerate.commands.launch"]
 
 # ---------------------------------------------------------------------------
 # Default settings
@@ -951,6 +990,7 @@ def start_training(
     threads = max(int(num_cpu_threads_per_process), 1)
     gpu_idx = gpu_index_from_choice(gpu_index_choice)
     tb_logdir = saved_cfg.get("last_tb_logdir", "")
+    accelerate_launch = resolve_accelerate_launch_cmd()
 
     # --- Backend-specific command assembly ---
     if backend == "kohya":
@@ -974,7 +1014,7 @@ def start_training(
             return
 
         cmd = [
-            sys.executable, "-m", "accelerate", "launch",
+            *accelerate_launch,
             "--config_file", str(ACCELERATE_CONFIG),
             "--num_cpu_threads_per_process", str(threads),
             "--gpu_ids", gpu_idx,
@@ -1021,7 +1061,7 @@ def start_training(
             return
 
         cmd = [
-            sys.executable, "-m", "accelerate", "launch",
+            *accelerate_launch,
             "--config_file", str(ACCELERATE_CONFIG),
             "--num_cpu_threads_per_process", str(threads),
             "--gpu_ids", gpu_idx,
