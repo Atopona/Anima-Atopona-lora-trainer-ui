@@ -274,7 +274,7 @@ def validate_dataset(image_dir: str) -> tuple[int, list[str], list[str]]:
 # ---------------------------------------------------------------------------
 
 def generate_diffsynth_metadata(image_dir: str, output_path: Path) -> tuple[Path, int]:
-    """Scan a kohya-style flat dir and write a DiffSynth metadata.csv with columns file_name,text."""
+    """Scan a kohya-style flat dir and write Anima DiffSynth metadata.csv."""
     rows = []
     for img in sorted(Path(image_dir).iterdir()):
         if not img.is_file() or img.suffix.lower() not in IMAGE_EXTS:
@@ -286,9 +286,9 @@ def generate_diffsynth_metadata(image_dir: str, output_path: Path) -> tuple[Path
                 caption = txt.read_text(encoding="utf-8").strip().replace("\n", " ")
             except Exception:
                 caption = ""
-        rows.append({"file_name": img.name, "text": caption})
+        rows.append({"image": img.name, "prompt": caption})
     with open(output_path, "w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["file_name", "text"])
+        writer = csv.DictWriter(f, fieldnames=["image", "prompt"])
         writer.writeheader()
         writer.writerows(rows)
     return output_path, len(rows)
@@ -410,16 +410,61 @@ def normalize_diffsynth_lora_target_modules(value: str) -> str:
 
 
 def migrate_diffsynth_args_for_anima(args: list[str]) -> list[str]:
-    """Repair saved DiffSynth arg files created with the old SD3/Wan target list."""
+    """Repair saved DiffSynth arg files created by older UI versions."""
     args = list(args)
     try:
         idx = args.index("--lora_target_modules")
     except ValueError:
+        pass
+    else:
+        value_idx = idx + 1
+        if value_idx < len(args):
+            args[value_idx] = normalize_diffsynth_lora_target_modules(args[value_idx])
+
+    if "--data_file_keys" not in args:
+        try:
+            metadata_idx = args.index("--dataset_metadata_path")
+            args[metadata_idx:metadata_idx] = ["--data_file_keys", "image"]
+        except ValueError:
+            args.extend(["--data_file_keys", "image"])
+
+    try:
+        metadata_idx = args.index("--dataset_metadata_path") + 1
+    except ValueError:
         return args
-    value_idx = idx + 1
-    if value_idx < len(args):
-        args[value_idx] = normalize_diffsynth_lora_target_modules(args[value_idx])
+    if metadata_idx < len(args):
+        args[metadata_idx] = str(migrate_diffsynth_metadata_for_anima(Path(args[metadata_idx])))
     return args
+
+
+def migrate_diffsynth_metadata_for_anima(metadata_path: Path) -> Path:
+    """Convert legacy DiffSynth metadata file_name/text columns to image/prompt."""
+    if not metadata_path.exists():
+        return metadata_path
+
+    with open(metadata_path, "r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames or []
+        rows = list(reader)
+
+    if "image" in fieldnames and "prompt" in fieldnames:
+        return metadata_path
+
+    image_key = "image" if "image" in fieldnames else "file_name"
+    prompt_key = "prompt" if "prompt" in fieldnames else "text"
+    if image_key not in fieldnames or prompt_key not in fieldnames:
+        return metadata_path
+
+    migrated_path = metadata_path.with_name(f"{metadata_path.stem}_anima.csv")
+    with open(migrated_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["image", "prompt"])
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({
+                "image": row.get(image_key, ""),
+                "prompt": row.get(prompt_key, ""),
+            })
+    return migrated_path
 
 
 def parse_version_tuple(value: str) -> tuple[int, ...]:
@@ -463,6 +508,7 @@ def create_diffsynth_training_args(
     args: list[str] = [
         "--dataset_base_path", str(image_dir),
         "--dataset_metadata_path", str(metadata_csv),
+        "--data_file_keys", "image",
         "--max_pixels", str(int(max_pixels)),
         "--dataset_repeat", str(int(dataset_repeat)),
         "--model_paths", model_paths_json,
